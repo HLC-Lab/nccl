@@ -31,7 +31,8 @@ typedef ncclNvlDomainInfo_v5_t ncclNvlDomainInfo_t;
 #define NCCL_ALGO_NVLS 4
 #define NCCL_ALGO_NVLS_TREE 5
 #define NCCL_ALGO_PAT 6
-#define NCCL_NUM_ALGORITHMS NCCL_NUM_ALGORITHMS_V5 // Tree/Ring/CollNet*/PAT
+#define NCCL_ALGO_BINE 7
+#define NCCL_NUM_ALGORITHMS NCCL_NUM_ALGORITHMS_V5 // Tree/Ring/CollNet*/PAT/Bine
 
 #define NCCL_PROTO_UNDEF -1
 #define NCCL_PROTO_LL 0

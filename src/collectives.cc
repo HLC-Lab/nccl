@@ -68,6 +68,7 @@ const char* ncclAlgoToString(int algo) {
   case NCCL_ALGO_NVLS: return "NVLS";
   case NCCL_ALGO_NVLS_TREE: return "NVLS_TREE";
   case NCCL_ALGO_PAT: return "PAT";
+  case NCCL_ALGO_BINE: return "BINE";
   default: return "Unknown";
   }
 }

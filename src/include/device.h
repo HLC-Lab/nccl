@@ -193,6 +193,21 @@ struct ncclTree {
   int down[NCCL_MAX_TREE_ARITY];
 };
 
+#define NCCL_MAX_BINE_STEPS 20
+struct ncclBineTables {
+  int* send;
+  int* recv;
+  int* partners;
+  int* index;
+  int* order;
+};
+
+struct ncclBine {
+  int nSteps;
+  struct ncclBineTables host;
+  struct ncclBineTables dev;
+};
+
 #define NCCL_MAX_DIRECT_ARITY 7
 struct ncclDirect {
   int depth;
@@ -415,6 +430,7 @@ struct alignas(16) ncclDevChannel {
   struct ncclDevChannelPeer** peers;
   struct ncclRing ring;
   struct ncclTree tree;
+  struct ncclBine bine;
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
   struct ncclNvls nvls;
@@ -589,20 +605,25 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     if (coll == ncclFuncSendRecv) break;
     row += 1;
 
-    int nAlgos = 4;
+    int nAlgos = 5;
     if (coll == ncclFuncAllGather) {
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                /*algo == NCCL_ALGO_PAT*/ 3;
+                  algo == NCCL_ALGO_PAT ? 3 :
+                  algo == NCCL_ALGO_BINE ? 4 :
+		  /* defaul to ring */ 0;
       row += algo1*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 1;
+    nAlgos = 2;
     if (coll == ncclFuncBroadcast) {
-      row += proto;
+      int algo1 = algo == NCCL_ALGO_RING ? 0 :
+                  algo == NCCL_ALGO_BINE ? 1 :
+                  /*default to ring */ 0;
+      row += algo1*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
@@ -614,26 +635,31 @@ inline int ncclDevFuncId(int coll, int devRedOp, int type, int algo, int proto) 
     }
     row += nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 6; // TREE RING COLLNET_DIRECT COLLNET_CHAIN NVLS NVLS_TREE
+    nAlgos = 7; // TREE RING COLLNET_DIRECT COLLNET_CHAIN NVLS NVLS_TREE BINE
     if (coll == ncclFuncAllReduce) {
       row += ((devRedOp*NumTypes + type)*nAlgos + algo)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 1;
+    nAlgos = 2;
     if (coll == ncclFuncReduce) {
-      row += (devRedOp*NumTypes + type)*NCCL_NUM_PROTOCOLS + proto;
+      int algo1 = algo == NCCL_ALGO_RING ? 0 :
+                  algo == NCCL_ALGO_BINE ? 1 :
+                 /*default to ring*/ 0;
+      row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }
     row += ncclNumDevRedOps*NumTypes*nAlgos*NCCL_NUM_PROTOCOLS;
 
-    nAlgos = 4;
+    nAlgos = 5;
     if (coll == ncclFuncReduceScatter) {
       int algo1 = algo == NCCL_ALGO_RING ? 0 :
                   algo == NCCL_ALGO_COLLNET_DIRECT ? 1 :
                   algo == NCCL_ALGO_NVLS ? 2 :
-                /*algo == NCCL_ALGO_PAT*/ 3;
+                  algo == NCCL_ALGO_PAT ? 3 : 
+                  algo == NCCL_ALGO_BINE ? 4 : 
+		  /* default to ring */ 0;
       row += ((devRedOp*NumTypes + type)*nAlgos + algo1)*NCCL_NUM_PROTOCOLS + proto;
       break;
     }

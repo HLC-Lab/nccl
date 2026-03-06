@@ -61,6 +61,11 @@ ncclResult_t initChannel(struct ncclComm* comm, int channelId) {
   /* guarantee addr has been copied into channel->devPeers */
   NCCLCHECK(ncclStrongStreamRelease(ncclCudaGraphNone(comm->config.graphUsageMode), &sharedRes->deviceStream, /*concurrent=*/false));
   NCCLCHECK(ncclStrongStreamSynchronize(&sharedRes->deviceStream));
+
+  // Bine setup (copy tables from comm to each channel)
+  for (int c = 0; c < comm->nChannels; ++c) {
+    comm->channels[c].bine = comm->bine;
+  }
   return ncclSuccess;
 }
 

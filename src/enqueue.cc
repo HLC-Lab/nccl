@@ -2018,6 +2018,7 @@ static ncclResult_t topoGetAlgoInfo(
   nt = nt/WARP_SIZE < 3 ? 3*WARP_SIZE : nt;
   if (info->algorithm == NCCL_ALGO_TREE) nt = NCCL_MAX_NTHREADS; // Tree now uses all threads always.
   if (info->algorithm == NCCL_ALGO_PAT) nt = NCCL_MAX_NTHREADS;
+  if (info->algorithm == NCCL_ALGO_BINE) nt = NCCL_MAX_NTHREADS;
   info->nMaxChannels = nc;
   info->nWarps = nt/WARP_SIZE;
   return ncclSuccess;
@@ -2097,13 +2098,18 @@ static ncclResult_t calcCollChunking(
 
   switch (info->func) {
   case ncclFuncBroadcast:
-    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeDown : ncclPatternPipelineFrom;
+    pattern = info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
+              info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeDown : 
+              ncclPatternPipelineFrom;
     break;
   case ncclFuncReduce:
-    pattern = info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUp : ncclPatternPipelineTo;
+    pattern = info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
+              info->algorithm == NCCL_ALGO_TREE ? ncclPatternTreeUp : 
+              ncclPatternPipelineTo;
     break;
   case ncclFuncReduceScatter:
     pattern =
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       info->algorithm == NCCL_ALGO_PAT ? ncclPatternPatUp :
       info->algorithm == NCCL_ALGO_NVLS ? ncclPatternNvls :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
@@ -2111,6 +2117,7 @@ static ncclResult_t calcCollChunking(
     break;
   case ncclFuncAllGather:
     pattern =
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       info->algorithm == NCCL_ALGO_PAT ? ncclPatternPatDown :
       info->algorithm == NCCL_ALGO_NVLS ? ncclPatternNvls :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
@@ -2118,6 +2125,7 @@ static ncclResult_t calcCollChunking(
     break;
   case ncclFuncAllReduce:
     pattern =
+      info->algorithm == NCCL_ALGO_BINE ? ncclPatternBine :
       info->algorithm == NCCL_ALGO_NVLS ? ncclPatternNvls :
       info->algorithm == NCCL_ALGO_NVLS_TREE ? ncclPatternNvlsTree :
       info->algorithm == NCCL_ALGO_COLLNET_DIRECT ? ncclPatternCollnetDirect :
@@ -2187,6 +2195,8 @@ static ncclResult_t calcCollChunking(
     while (nBytes / (nChannels*chunkSize) < nstepsLL128*64/ppn && chunkSize > 131072) chunkSize /= 2;
     // coverity[integer_division]
     while (nBytes / (nChannels*chunkSize) < nstepsLL128*16/ppn && chunkSize > 32768) chunkSize /= 2;
+  } else if (info->algorithm == NCCL_ALGO_BINE) {
+    while (chunkSize*nChannels*32 > nBytes && chunkSize > 65536) chunkSize /= 2;
   } else if (info->func == ncclFuncAllGather && info->algorithm == NCCL_ALGO_PAT) {
     while (chunkSize*nChannels*32 > nBytes && chunkSize > 65536) chunkSize /= 2;
   } else if (info->func == ncclFuncReduceScatter && info->algorithm == NCCL_ALGO_PAT) {
@@ -2229,6 +2239,9 @@ static ncclResult_t calcCollChunking(
     break;
   case ncclPatternNvlsTree:
     nstepsPerLoop = 1; nchunksPerLoop = comm->channels[0].nvls.nHeads;
+    break;
+  case ncclPatternBine:
+    nstepsPerLoop = nchunksPerLoop = 1; // TODO: Double check what's the impact
     break;
   default:
     WARN("Unknown pattern %d", pattern);
@@ -2296,6 +2309,8 @@ static ncclResult_t calcCollChunking(
         proxyOp->nsteps = DIVUP(nBytes, proxyOp->loopSize) * nstepsPerLoop;
         proxyOp->loopOffset = 0;
       }
+    } else if (info->algorithm == NCCL_ALGO_BINE) {
+  	; // TODO: Not sure
     } else {
       WARN("Net registration invalid algorithm %s", ncclAlgoToString(info->algorithm));
       return ncclInternalError;
@@ -2341,6 +2356,9 @@ static ncclResult_t calcCollChunking(
   case ncclPatternNvls:
   case ncclPatternProfiler:
     // Peer count hints unused
+    break;
+  case ncclPatternBine:
+    proxyOp->nPeers = 1; // TODO: Not sure, check on Vona's code
     break;
   case ncclPatternSend:
   case ncclPatternRecv:

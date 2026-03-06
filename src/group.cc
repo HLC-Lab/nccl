@@ -179,6 +179,10 @@ static ncclResult_t ncclCollPreconnect(struct ncclComm* comm, bool* algoNeedConn
           NCCLCHECK(ncclTransportPatConnect(comm));
           break;
         }
+        case NCCL_ALGO_BINE: {
+          NCCLCHECK(ncclTransportBineConnect(comm));
+          break;
+        }
         // Yes, it's a dead code.  That's fine...
         // coverity[dead_error_begin]
         default: {

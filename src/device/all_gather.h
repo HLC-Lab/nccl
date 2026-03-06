@@ -84,6 +84,100 @@ namespace {
   }
 }
 
+  template <typename T, typename RedOp, typename Proto>
+  __device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl* work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+    const int steps = bine->nDoublingSteps;
+
+    // 1. Sanity check
+    if (steps == 0 || !bine->partners || !bine->index || !bine->order) {
+      runRing<T, RedOp, Proto>(tid, nthreads, work);
+      return;
+    }
+
+    // 2. Partitioning
+    ssize_t count, gridOffset, channelCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                    &count, &gridOffset, &channelCount, &chunkCount);
+
+    if (channelCount == 0)
+      return;
+
+    T *recvBuf = (T *)work->recvbuff;
+    T *sendBuf = (T *)work->sendbuff;
+    const int rank = ncclShmem.comm.rank;
+
+    // 3. Seed Local Segment (Input -> Output)
+    T *mySeg = recvBuf + (ssize_t)rank * count;
+    if (sendBuf != mySeg) {
+      for (ssize_t elem = tid; elem < channelCount; elem += nthreads)
+      {
+        mySeg[gridOffset + elem] = sendBuf[gridOffset + elem];
+      }
+    }
+    // Barrier to make sure everytone wrote their segment
+    __syncthreads();
+
+    const int myIdx = bine->index[rank];
+    const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+    // 4. Main Loop
+    for (ssize_t elem = 0; elem < channelCount; elem += chunkCount) {
+      const ssize_t dataOff = gridOffset + elem;
+      const int ne = (int)min(chunkCount, channelCount - elem);
+
+      for (int s = 0; s < steps; ++s) {
+        const int partner = bine->partners[rank * steps + s];
+        if (partner < 0)
+          continue;
+
+        // Recursive Doubling Logic
+        const int span = 1 << s;
+        const int blockSize = span << 1;
+        const int base = (myIdx / blockSize) * blockSize;
+        const bool keepLower = ((myIdx >> s) & 1) == 0;
+
+        const int sendBeg = keepLower ? base : base + span;
+        const int recvBeg = keepLower ? base + span : base;
+
+        int peers[1] = {partner};
+
+        // 5. Communication logic
+        auto runStepInterleaved = [&](auto &prim) {
+          for (int j = 0; j < span; ++j)
+          {
+            int sIdx = sendBeg + j;
+            int rIdx = recvBeg + j;
+
+            ssize_t sendOff = dataOff + (ssize_t)bine->order[sIdx] * count;
+            ssize_t recvOff = dataOff + (ssize_t)bine->order[rIdx] * count;
+
+            // First send and then receive to avoid deadlocks
+            prim.directSendFromOutput(sendOff, ne);
+            prim.directRecv(recvOff, ne);
+          }
+        };
+
+        if (useDirect) {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+          runStepInterleaved(prim);
+        }
+        else {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prim(tid, nthreads, peers, peers, recvBuf, recvBuf, work->redOpArg);
+
+          for (int j = 0; j < span; ++j) {
+            ssize_t sendOff = dataOff + (ssize_t)bine->order[sendBeg + j] * count;
+            ssize_t recvOff = dataOff + (ssize_t)bine->order[recvBeg + j] * count;
+            prim.sendFromOutput(sendOff, ne);
+            prim.recv(recvOff, ne);
+          }
+        }
+      }
+    }
+  }
+}
+
+
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -171,6 +265,29 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
 #endif
   }
 };
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    using Proto = ProtoSimple<ALLGATHER_CHUNKSTEPS / ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>;
+    runBine<T, RedOp, Proto>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    runBine<T, RedOp, ProtoLL>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128> {
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    runBine<T, RedOp, ProtoLL128>(tid, nthreads, work);
+  }
+};
+
 
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_NVLS, NCCL_PROTO_SIMPLE> {

@@ -16,7 +16,7 @@ typedef struct {
   int maxRanksPerNvlDomain;           // maximum ranks across all NVLink domains
 } ncclNvlDomainInfo_v5_t;
 
-#define NCCL_NUM_ALGORITHMS_V5 7 // Tree/Ring/CollNet*/PAT
+#define NCCL_NUM_ALGORITHMS_V5 8 // Tree/Ring/CollNet*/PAT/Bine
 #define NCCL_NUM_PROTOCOLS_V5 3 // Simple/LL/LL128
 #define NCCL_NUM_HW_LINKS_V5 3
 #define NCCL_NUM_COMPCAPS_V5 4

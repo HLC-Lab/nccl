@@ -148,6 +148,7 @@ struct ncclChannel {
   struct ncclRing ring;
   int* devRingUserRanks;
   struct ncclTree tree;
+  struct ncclBine bine;
 
   struct ncclTree collnetChain;
   struct ncclDirect collnetDirect;
@@ -527,6 +528,7 @@ struct ncclComm {
   int* topParentRanks;
   int* topParentLocalRanks;
   struct ncclChannel channels[MAXCHANNELS];
+  struct ncclBine bine;
   struct ncclPeerInfo* peerInfo;
   struct ncclTopoSystem* topo;
   struct ncclProxyConnector* gproxyConn;

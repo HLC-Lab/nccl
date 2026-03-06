@@ -145,26 +145,26 @@ static const ncclTunerConstants_t ncclTunerConstantsDefaults = {
     {  6.8, 14.0,  8.4 }, {  6.6, 14.0,  8.4 },  // Tree, Ring
     {    0,    0,    0 }, {    0,    0,    0 },  // Collnet Direct, Chain
     {    0,    0,    0 }, {    0,    0,    0 },  // NVLS, NVLS Tree
-    {  8.0,  8.0,  8.0 }                         // PAT
+    {  8.0,  8.0,  8.0 }, {  8.0,  8.0,  8.0 }   // PAT, Bine
     },
   .hwLatencies = {
   /* NVLINK */
-  { { .6, 1.25, 4.0 }, { .6, 1.9, 3.4 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
+  { { .6, 1.25, 4.0 }, { .6, 1.9, 3.4 },  /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
-    {  0,    0,  25 }, {  0,   0,  25 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
+    {  0,    0,  25 }, {  0,   0,  25 },  /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
+    {  0,    0, 4.0 }, {  0,   0, 4.0 }   /* PAT (LL/LL128/Simple), Bine (LL/LL128/Simple)*/
     },
   /* PCI */
   { { 1.0, 1.9, 4.0 }, { 1.0, 2.5, 5.7 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
     {  0,    0, 3.7 }, {  0,   0,  2.8 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
     {  0,    0,   0 }, {  0,   0,    0 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {  0,    0, 4.0 } /* PAT (LL/LL128/Simple)*/
+    {  0,    0, 4.0 }, {  0,    0, 4.0 }  /* PAT (LL/LL128/Simple), Bine (LL/LL128/Simple)*/
     },
   /* NET */
   { { 5.0, 8.5, 14 }, { 2.7, 4.0, 14.0 }, /* Tree (LL/LL128/Simple), Ring (LL/LL128/Simple)*/
-    {   0,   0, 31 }, {   0,   0,   30 }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
-    {   0,   0, 18 }, {   0,   0,   20.9 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
-    {   0,   0, 14 } /* PAT (LL/LL128/Simple)*/
+    {   0,   0, 31 }, {   0,   0, 30   }, /* CollNetDirect (LL/LL128/Simple), CollNetChain (LL/LL128/Simple)*/
+    {   0,   0, 18 }, {   0,   0, 20.9 }, /* NVLS (LL/LL128/Simple), NVLSTree (LL/LL128/Simple)*/
+    {   0,   0, 14 }, {   0,   0, 14   }  /* PAT (LL/LL128/Simple), Bine (LL/LL128/Simple)*/
     },
   },
   .llMaxBws = {
@@ -233,14 +233,17 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, simpleDefaultThreads);
   comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_SIMPLE] =
+    comm->maxThreads[NCCL_ALGO_BINE][NCCL_PROTO_SIMPLE] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_SIMPLE_MAX_NTHREADS, NCCL_SIMPLE_MAX_NTHREADS);
   comm->maxThreads[NCCL_ALGO_COLLNET_DIRECT][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_COLLNET_CHAIN][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_NVLS][NCCL_PROTO_SIMPLE] =
     comm->maxThreads[NCCL_ALGO_NVLS_TREE][NCCL_PROTO_SIMPLE] = NCCL_MAX_NTHREADS;
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL] =
+    comm->maxThreads[NCCL_ALGO_BINE][NCCL_PROTO_LL] =
     getNthreads("NCCL_NTHREADS", ncclParamNthreads(), 2*WARP_SIZE, NCCL_LL_MAX_NTHREADS, NCCL_LL_MAX_NTHREADS);
   comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_LL128] = comm->maxThreads[NCCL_ALGO_TREE][NCCL_PROTO_LL128] =
+    comm->maxThreads[NCCL_ALGO_BINE][NCCL_PROTO_LL128] =
     getNthreads("NCCL_LL128_NTHREADS", ncclParamLl128Nthreads(), NCCL_LL128_MAX_NTHREADS/4, NCCL_LL128_MAX_NTHREADS, NCCL_LL128_MAX_NTHREADS);
 
   int nNodes = comm->nNodes;
@@ -271,10 +274,10 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
       nRanks;
 
     for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
-      if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && a != NCCL_ALGO_RING) continue;
+      if ((coll == ncclFuncBroadcast || coll == ncclFuncReduce) && (a != NCCL_ALGO_RING && a != NCCL_ALGO_BINE)) continue;
       if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
           && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
-          && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT) continue;
+          && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT && a != NCCL_ALGO_BINE) continue;
       if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
 
       for (int p=0; p<NCCL_NUM_PROTOCOLS; p++) {
@@ -309,6 +312,7 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
         if (a == NCCL_ALGO_TREE && p == NCCL_PROTO_LL128) busBw = std::min(busBw * (nNodes == 1 ? 7.0/9.0 : 120.0/128.0), graphs[a]->nChannels*perChMaxTreeLL128Bw);
         if (a == NCCL_ALGO_TREE && comm->maxTreePattern == NCCL_TOPO_PATTERN_TREE) busBw *= .85;
         if (a == NCCL_ALGO_PAT) busBw *= .75;
+        if (a == NCCL_ALGO_BINE) busBw *= .75; // TODO: Not sure how this works, just having it here as a placeorder for the moment
         if (a == NCCL_ALGO_COLLNET_DIRECT && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
         if (a == NCCL_ALGO_COLLNET_CHAIN && p != NCCL_PROTO_SIMPLE) busBw = 0;  // Not used
         if (a == NCCL_ALGO_COLLNET_DIRECT && p == NCCL_PROTO_SIMPLE) {
@@ -399,6 +403,9 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
             comm->latencies[coll][a][p] += log2i(nNodes) * (interLat/3.5) // Log latency
               + nRanks * 2.8; // Still a linear part; hopefully we'll manage to remove it at some point.
           }
+        } else if (a == NCCL_ALGO_BINE) { // TODO: Not sure how this works, just having it here as a placeorder for the moment
+            comm->latencies[coll][a][p] += log2i(nNodes) * (interLat/3.5) // Log latency
+              + nRanks * 2.8; // Still a linear part; hopefully we'll manage to remove it at some point.
         }
       }
     }

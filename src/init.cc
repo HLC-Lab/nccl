@@ -33,6 +33,7 @@
 #include "os.h"
 #include "env.h"
 #include "rma/rma.h"
+#include <sstream>
 
 #define STR2(v) #v
 #define STR(v) STR2(v)
@@ -44,7 +45,7 @@
 #endif
 
 const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
-const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
+const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT", "Bine" };
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
 
 NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
@@ -416,6 +417,461 @@ exit:
   return ret;
 }
 
+static inline size_t idx(int vr, int step, int steps) {
+  return (size_t)vr * steps + step;
+}
+
+// ------------------------------------------------------------
+// Common helpers
+// ------------------------------------------------------------
+static inline int pmod(int x, int m) {
+  int r = x % m;
+  return r < 0 ? r + m : r;
+}
+
+static inline int bine_max_positive(int steps) {
+  int m = 0;
+  for (int j = 0; j < steps; j += 2)
+    m += (1 << j);
+  return m;
+}
+
+// Map rank r in [0..nRanks-1] to its s-bit negabinary representation,
+// returned as an integer whose binary digits are the negabinary digits.
+static inline int rank2nb(int r, int nRanks, int steps) {
+  // nRanks must be 2^steps
+  assert((1 << steps) == nRanks);
+
+  const int m = bine_max_positive(steps);
+
+  // Value to represent in base -2, as in Sec. 2.3.1:
+  //  - if r <= m: use r
+  //  - else:      use r - nRanks (negative)
+  int x = (r <= m) ? r : r - nRanks;
+
+  unsigned int bits = 0;
+  unsigned int mask = 1u;
+
+  // Standard base -2 conversion:
+  // while x != 0:
+  //   rem = x & 1;
+  //   x = (x - rem)/(-2);
+  //   emit rem as next bit
+  //
+  // We do exactly s iterations to get an s-bit representation.
+  for (int j = 0; j < steps; ++j)
+  {
+    int rem = x & 1; // 0 or 1
+    if (rem)
+      bits |= mask;     // set bit j
+    x = (x - rem) / -2; // exact division (x - rem is even)
+    mask <<= 1;
+  }
+
+  // x should be zero here for any representable rank
+  return static_cast<int>(bits);
+}
+
+// Decode an s-bit negabinary representation (stored in the bits of nb)
+// back to the rank in [0..nRanks-1].
+static inline int nb2rank_bits(int nb, int nRanks, int steps) {
+  int x = 0;   // integer value in Z
+  int pow = 1; // (-2)^0
+
+  for (int j = 0; j < steps; ++j)
+  {
+    if (nb & (1u << j))
+      x += pow;
+    pow *= -2; // next power of -2
+  }
+
+  // Map back from value in [-m, +m] to rank in [0..p-1]
+  return (x >= 0) ? x : x + nRanks;
+}
+
+static inline int nb2rank(int nb, int nRanks) {
+  // nRanks must be a power of two; compute steps = log2(nRanks)
+  int steps = 0;
+  int tmp = nRanks;
+  while (tmp > 1)
+  {
+    tmp >>= 1;
+    ++steps;
+  }
+  return nb2rank_bits(nb, nRanks, steps);
+}
+
+static void ncclBineBuildVirtualHalvingSchedule(int nRanks, int steps, int *sendTable, int *recvTable) {
+  if (nRanks <= 0 || !sendTable || !recvTable)
+    return;
+  assert((1 << steps) == nRanks && "nRanks must be a power of two");
+
+  size_t elems = (size_t)nRanks * steps;
+  std::fill(sendTable, sendTable + elems, -1);
+  std::fill(recvTable, recvTable + elems, -1);
+
+  // Helper to count consecutive equal LSBs in negabinary representation (paper's u)
+  auto count_trailing_equal_bits = [&](int nb_val) -> int
+  {
+    if (nb_val == 0)
+      return steps;
+    int last_bit = nb_val & 1;
+    int count = 1;
+    for (int i = 1; i < steps; i++)
+    {
+      int current_bit = (nb_val >> i) & 1;
+      if (current_bit == last_bit)
+      {
+        count++;
+      }
+      else
+      {
+        break;
+      }
+    }
+    return count;
+  };
+
+  // Build schedule according to paper Sec 2.3
+  for (int r = 0; r < nRanks; ++r)
+  {
+    // Convert rank to negabinary representation
+    int r_nb = rank2nb(r, nRanks, steps);
+
+    // For root (rank 0), send at all steps
+    if (r == 0)
+    {
+      for (int step = 0; step < steps; step++)
+      {
+        int mask = (1 << (steps - step)) - 1; // s-step ones
+        int child_nb = r_nb ^ mask;
+        int child = nb2rank(child_nb, nRanks);
+        sendTable[idx(r, step, steps)] = child;
+        recvTable[idx(child, step, steps)] = r;
+      }
+      continue;
+    }
+
+    // For non-root ranks: determine receive step using negabinary value
+    int u = count_trailing_equal_bits(r_nb);
+    int recv_step = steps - u;
+
+    if (recv_step < 0 || recv_step >= steps)
+    {
+      fprintf(stderr, "[BINE] invalid recv_step=%d for r=%d (u=%d)\n", recv_step, r, u);
+      continue;
+    }
+
+    // Find parent using XOR with mask (paper Eq 1)
+    int mask = (1 << (steps - recv_step)) - 1;
+    int parent_nb = r_nb ^ mask;
+    int parent = nb2rank(parent_nb, nRanks);
+
+    recvTable[idx(r, recv_step, steps)] = parent;
+    sendTable[idx(parent, recv_step, steps)] = r;
+
+    // After receiving, this rank sends in subsequent steps
+    for (int send_step = recv_step + 1; send_step < steps; send_step++)
+    {
+      int send_mask = (1 << (steps - send_step)) - 1;
+      int child_nb = r_nb ^ send_mask;
+      int child = nb2rank(child_nb, nRanks);
+      sendTable[idx(r, send_step, steps)] = child;
+      recvTable[idx(child, send_step, steps)] = r;
+    }
+  }
+}
+
+void ncclBineBuildHalvingSchedule(int nRanks, int steps, int *sendTable, int *recvTable) {
+  if (nRanks <= 0 || !sendTable || !recvTable)
+    return;
+  assert((1 << steps) == nRanks && "nRanks must be a power of two");
+
+  const size_t vrElems = (size_t)nRanks * steps;
+  std::vector<int> virtualSend(vrElems, -1);
+  std::vector<int> virtualRecv(vrElems, -1);
+  ncclBineBuildVirtualHalvingSchedule(nRanks, steps, virtualSend.data(), virtualRecv.data());
+
+  const size_t blockStride = (size_t)nRanks * steps;
+  const size_t totalElems = (size_t)nRanks * blockStride;
+  std::fill(sendTable, sendTable + totalElems, -1);
+  std::fill(recvTable, recvTable + totalElems, -1);
+
+  for (int root = 0; root < nRanks; ++root)
+  {
+    for (int rank = 0; rank < nRanks; ++rank)
+    {
+      const int vrank = pmod(rank - root, nRanks);
+      const size_t dstBase = ((size_t)root * blockStride) + (size_t)rank * steps;
+      const size_t srcBase = (size_t)vrank * steps;
+      for (int step = 0; step < steps; ++step)
+      {
+        const int sendVR = virtualSend[srcBase + step];
+        const int recvVR = virtualRecv[srcBase + step];
+        sendTable[dstBase + step] = (sendVR < 0) ? -1 : pmod(sendVR + root, nRanks);
+        recvTable[dstBase + step] = (recvVR < 0) ? -1 : pmod(recvVR + root, nRanks);
+      }
+    }
+  }
+}
+
+void ncclBineBuildDoublingSchedule(int nRanks, int steps, int *partners, int *index, int *order) {
+  if (nRanks <= 0 || !partners)
+    return;
+  assert((1 << steps) == nRanks && "nRanks must be a power of two");
+
+  size_t elems = (size_t)nRanks * steps;
+  std::fill(partners, partners + elems, -1);
+
+  // Step 1: Compute v(r) for all ranks (Sec 3.2.1)
+  std::vector<int> v_representation(nRanks);
+  for (int r = 0; r < nRanks; ++r)
+  {
+    int h_val;
+    if (r % 2 == 0)
+    { // even rank
+      h_val = rank2nb(nRanks - r, nRanks, steps);
+    }
+    else
+    { // odd rank
+      h_val = rank2nb(r, nRanks, steps);
+    }
+    v_representation[r] = h_val ^ (h_val >> 1); // v(r) = h(r) XOR (h(r) >> 1)
+  }
+
+  // Build index and order tables
+  for (int r = 0; r < nRanks; ++r)
+  {
+    const int idxVal = v_representation[r]; // ∈ [0, 2^steps)
+    index[r] = idxVal;
+    order[idxVal] = r;
+  }
+
+  // Step 2: Build partner table (Sec 3.2.2)
+  for (int step = 0; step < steps; ++step)
+  {
+    int bit_mask = 1 << step; // 2^step
+
+    for (int r = 0; r < nRanks; ++r)
+    {
+      int target_v = v_representation[r] ^ bit_mask;
+
+      // Find rank with matching v_representation
+      for (int q = 0; q < nRanks; ++q)
+      {
+        if (v_representation[q] == target_v)
+        {
+          partners[idx(r, step, steps)] = q;
+          break;
+        }
+      }
+    }
+  }
+}
+
+ncclResult_t ncclCommInitBine(struct ncclComm *comm) {
+  // Bine info initialization
+  // For the moment Bine only works if the number of ranks is a power of two.
+  // Check if that's the case (and if there is more than one rank). If so, set the number of steps to log2 of the number of ranks.
+  int nSteps = (isPow2(comm->nRanks) && comm->nRanks > 1) ? log2i(comm->nRanks) : 0;    
+
+  if (!isPow2(comm->nRanks)) {
+    INFO(NCCL_GRAPH, "Bine disabled because communicator size %d is not a power of two", comm->nRanks);
+    return ncclSuccess;
+  } else if (comm->nRanks <= 1) {
+    INFO(NCCL_GRAPH, "Bine disabled because communicator size %d is not greater than one", comm->nRanks);
+    return ncclSuccess;
+  } else if (nSteps >= NCCL_MAX_BINE_STEPS){
+    INFO(NCCL_GRAPH, "Bine disabled because it requires %d steps which exceeds NCCL_MAX_BINE_STEPS=%d", nSteps, NCCL_MAX_BINE_STEPS);
+    return ncclSuccess;
+  }
+
+  comm->bine.nSteps = nSteps;  
+  // Allocate Bine tables 
+  // TODO: Too large, find a away to make them smaller.
+  const size_t halvingTableElems = (size_t)comm->nRanks * comm->nRanks * comm->bine.nSteps;
+  const size_t doublingTableElems = (size_t)comm->nRanks * comm->bine.nSteps;  
+  const size_t mapElems = (size_t)comm->nRanks;
+  size_t halvingSize = halvingTableElems * sizeof(int);
+  size_t doublingSize = doublingTableElems * sizeof(int);
+  size_t mapSize = mapElems * sizeof(int);
+
+  // -------------------------
+  // Host allocations (idempotent)
+  // -------------------------
+  if (comm->bine.host.send == nullptr) {
+    comm->bine.host.send = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingTableElems);
+  } else {
+    WARN("Bine host buffer bine.host.send already allocated at %p, reusing", comm->bine.host.send);
+  }
+
+  if (comm->bine.host.recv == nullptr) {
+    comm->bine.host.recv = ncclMemoryStackAlloc<int>(&comm->memPermanent, halvingTableElems);
+  } else {
+    WARN("Bine host buffer bine.host.recv already allocated at %p, reusing", comm->bine.host.recv);
+  }
+
+  if (comm->bine.host.partners == nullptr) {
+    comm->bine.host.partners = ncclMemoryStackAlloc<int>(&comm->memPermanent, doublingTableElems);
+  } else {
+    WARN("Bine host buffer bine.host.partners already allocated at %p, reusing", comm->bine.host.partners);
+  }
+
+  if (comm->bine.host.index == nullptr) {
+    comm->bine.host.index = ncclMemoryStackAlloc<int>(&comm->memPermanent, mapElems);
+  } else {
+    WARN("Bine host buffer bine.host.index already allocated at %p, reusing", comm->bine.host.index);
+  }
+
+  if (comm->bine.host.order == nullptr) {
+    comm->bine.host.order = ncclMemoryStackAlloc<int>(&comm->memPermanent, mapElems);
+  } else {
+    WARN("Bine host buffer bine.host.order already allocated at %p, reusing", comm->bine.host.order);
+  }
+
+  // -------------------------
+  // Device allocations (idempotent)
+  // -------------------------
+  // Note: We use ncclCudaCalloc which generally uses cudaMalloc.
+  // Ensure we are on the correct device (set in commAlloc).
+  if (comm->bine.dev.send == nullptr) {
+    NCCLCHECK(ncclCudaCalloc((char **)&comm->bine.dev.send, halvingSize, comm->memManager));
+    ncclCommPushCudaFree(comm, comm->bine.dev.send);
+  } else {
+    WARN("Bine device buffer bine.dev.send already allocated at %p, reusing",
+          comm->bine.dev.send);
+  }
+
+  if (comm->bine.dev.recv == nullptr) {
+    NCCLCHECK(ncclCudaCalloc((char **)&comm->bine.dev.recv, halvingSize, comm->memManager));
+    ncclCommPushCudaFree(comm, comm->bine.dev.recv);
+  } else {
+    WARN("Bine device buffer bine.dev.recv already allocated at %p, reusing",
+          comm->bine.dev.recv);
+  }
+
+  if (comm->bine.dev.partners == nullptr) {
+    NCCLCHECK(ncclCudaCalloc((char **)&comm->bine.dev.partners, doublingSize, comm->memManager));
+    ncclCommPushCudaFree(comm, comm->bine.dev.partners);
+  } else {
+    WARN("Bine device buffer bine.dev.partners already allocated at %p, reusing",
+          comm->bine.dev.partners);
+  }
+
+  if (comm->bine.dev.index == nullptr) {
+    NCCLCHECK(ncclCudaCalloc((char **)&comm->bine.dev.index, mapSize, comm->memManager));
+    ncclCommPushCudaFree(comm, comm->bine.dev.index);
+  } else {
+    WARN("Bine device buffer bine.dev.index already allocated at %p, reusing",
+          comm->bine.dev.index);
+  }
+
+  if (comm->bine.dev.order == nullptr) {
+    NCCLCHECK(ncclCudaCalloc((char **)&comm->bine.dev.order, mapSize, comm->memManager));
+    ncclCommPushCudaFree(comm, comm->bine.dev.order);
+  } else {
+    WARN("Bine device buffer bine.dev.order already allocated at %p, reusing",
+          comm->bine.dev.order);
+  }
+
+  std::vector<int> sendTable(halvingTableElems, -1);
+  std::vector<int> recvTable(halvingTableElems, -1);
+  std::vector<int> partnerTable(doublingTableElems, -1);
+  std::vector<int> indexMap(mapElems, 0);
+  std::vector<int> orderMap(mapElems, 0);
+  ncclBineBuildHalvingSchedule(comm->nRanks, comm->bine.nSteps,
+                               sendTable.data(),
+                               recvTable.data());
+  ncclBineBuildDoublingSchedule(comm->nRanks, comm->bine.nSteps,
+                                partnerTable.data(),
+                                indexMap.data(),
+                                orderMap.data());
+
+  // Sanity check
+  for (int r = 0; r < comm->nRanks; ++r) {
+    int myIdx = indexMap[r];
+    for (int s = 0; s < comm->bine.nSteps; ++s) {
+      int p = partnerTable[(size_t)r * comm->bine.nSteps + s];
+      if (p < 0)
+        continue;
+
+      int pIdx = indexMap[p];
+      int bitMy = (myIdx >> s) & 1;
+      int bitPar = (pIdx >> s) & 1;
+
+      if (bitMy == bitPar) {
+        WARN("Bine BAD schedule: r=%d (idx=%d) partner=%d (idx=%d) have same bit at step %d\n",
+             r, myIdx, p, pIdx, s);
+        WARN("Disabling Bine (invalid doubling schedule)");
+      }
+    }
+  }
+
+  auto logScheduleRow = [&](const char *label, const std::vector<int> &table, size_t offset, int stride, int width)
+  {
+    if (width <= 0 || stride <= 0)
+      return;
+    std::ostringstream oss;
+    oss << "Bine " << label << " rank " << comm->rank << " first " << std::min(width, 8);
+    for (int i = 0; i < std::min(width, 8); ++i)
+    {
+      oss << " " << table[offset + i];
+    }
+    if (width > 8)
+      oss << " ...";
+    INFO(NCCL_GRAPH, "%s", oss.str().c_str());
+  };
+
+  const size_t halvingOffset = (size_t)comm->rank * comm->bine.nSteps;
+  logScheduleRow("send schedule", sendTable, halvingOffset, comm->bine.nSteps, comm->bine.nSteps);
+  logScheduleRow("recv schedule", recvTable, halvingOffset, comm->bine.nSteps, comm->bine.nSteps);
+  logScheduleRow("partner schedule", partnerTable, (size_t)comm->rank * comm->bine.nSteps, comm->bine.nSteps, comm->bine.nSteps);
+
+  if (!indexMap.empty())
+  {
+    std::ostringstream oss;
+    oss << "Bine index map rank " << comm->rank << " first " << std::min((int)indexMap.size(), 8);
+    for (int i = 0; i < std::min((int)indexMap.size(), 8); ++i)
+    {
+      oss << " " << indexMap[i];
+    }
+    if ((int)indexMap.size() > 8)
+      oss << " ...";
+    INFO(NCCL_GRAPH, "%s", oss.str().c_str());
+    if (comm->rank < (int)indexMap.size())
+    {
+      INFO(NCCL_GRAPH, "Bine index map self rank %d -> %d", comm->rank, indexMap[comm->rank]);
+    }
+  }
+
+  if (!orderMap.empty())
+  {
+    std::ostringstream oss;
+    oss << "Bine order map rank " << comm->rank << " first " << std::min((int)orderMap.size(), 8);
+    for (int i = 0; i < std::min((int)orderMap.size(), 8); ++i)
+    {
+      oss << " " << orderMap[i];
+    }
+    if ((int)orderMap.size() > 8)
+      oss << " ...";
+    INFO(NCCL_GRAPH, "%s", oss.str().c_str());
+    if (comm->rank < (int)orderMap.size())
+    {
+      INFO(NCCL_GRAPH, "Bine order map self rank %d -> %d", comm->rank, orderMap[comm->rank]);
+    }
+  }
+
+  memcpy(comm->bine.host.send, sendTable.data(), halvingTableElems * sizeof(int));
+  memcpy(comm->bine.host.recv, recvTable.data(), halvingTableElems * sizeof(int));
+  memcpy(comm->bine.host.partners, partnerTable.data(), doublingTableElems * sizeof(int));
+  memcpy(comm->bine.host.index, indexMap.data(), mapElems * sizeof(int));
+  memcpy(comm->bine.host.order, orderMap.data(), mapElems * sizeof(int));
+
+  INFO(NCCL_GRAPH, "Bine shared tables copied for rank %d steps %d", comm->rank, comm->bine.nSteps);
+
+  return ncclSuccess;
+}
+ 
 static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -539,6 +995,7 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   } while (0);
 
   ncclIntruQueueConstruct(&comm->eventCallbackQueue);
+  NCCLCHECK(ncclCommInitBine(comm));
 
   return ncclSuccess;
 }
@@ -627,12 +1084,44 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.channels[c].ring = comm->channels[c].ring;
     tmpCommAndChans.channels[c].ring.userRanks = comm->channels[c].devRingUserRanks;
     tmpCommAndChans.channels[c].tree = comm->channels[c].tree;
+    tmpCommAndChans.channels[c].bine = comm->channels[c].bine;
     tmpCommAndChans.channels[c].collnetChain = comm->channels[c].collnetChain;
     tmpCommAndChans.channels[c].collnetDirect = comm->channels[c].collnetDirect;
     tmpCommAndChans.channels[c].nvls = comm->channels[c].nvls;
 
     if (comm->channels[c].ring.userRanks != nullptr) {
       NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].ring.userRanks, comm->channels[c].ring.userRanks, nRanks, deviceStream), ret, fail);
+    }
+
+    // 1. Handle Halving Tables (Send/Recv)
+    if (comm->channels[c].bine.nSteps > 0 &&
+        comm->channels[c].bine.host.send != nullptr && comm->channels[c].bine.dev.send != nullptr &&
+        comm->channels[c].bine.host.recv != nullptr && comm->channels[c].bine.dev.recv != nullptr)
+    {
+      size_t halvingElems = (size_t)comm->channels[c].bine.nSteps * nRanks * nRanks;
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dev.send, comm->channels[c].bine.host.send, halvingElems, deviceStream), ret, fail);
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dev.recv, comm->channels[c].bine.host.recv, halvingElems, deviceStream), ret, fail);
+    }
+
+    // 2. Handle Doubling Table (Partners)
+    if (comm->channels[c].bine.nSteps > 0 &&
+        comm->channels[c].bine.host.partners != nullptr && comm->channels[c].bine.dev.partners != nullptr)
+    {
+      size_t doublingElems = (size_t)comm->channels[c].bine.nSteps * nRanks;
+      NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dev.partners, comm->channels[c].bine.host.partners, doublingElems, deviceStream), ret, fail);
+    }
+
+    // 3. Handle Index and Order
+    if (nRanks > 0)
+    {
+      if (comm->channels[c].bine.host.index != nullptr && comm->channels[c].bine.dev.index != nullptr)
+      {
+        NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dev.index, comm->channels[c].bine.host.index, nRanks, deviceStream), ret, fail);
+      }
+      if (comm->channels[c].bine.host.order != nullptr && comm->channels[c].bine.dev.order != nullptr)
+      {
+        NCCLCHECKGOTO(ncclCudaMemcpyAsync(tmpCommAndChans.channels[c].bine.dev.order, comm->channels[c].bine.host.order, nRanks, deviceStream), ret, fail);
+      }
     }
   }
 
@@ -1379,6 +1868,9 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
 
     // Connect PAT only for communicators with 1 GPU per node
     if (comm->maxLocalRanks == 1) NCCLCHECKGOTO(ncclTransportPatConnect(comm), ret, fail);
+
+    // Connect Bine
+    NCCLCHECKGOTO(ncclTransportBineConnect(comm), ret, fail);
 
     // Attempt to setup NVLS
     NCCLCHECKGOTO(ncclNvlsSetup(comm, parent), ret, fail);

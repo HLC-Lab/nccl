@@ -56,6 +56,140 @@ namespace {
   }
 }
 
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBine(int tid, int nthreads, ncclDevWorkColl *work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+
+    const int steps = bine->nSteps;
+    if (steps == 0 || !bine->index || !bine->order)
+    {
+      runRing<T, RedOp, Proto>(tid, nthreads, work);
+      return;
+    }
+
+    ssize_t count, gridOffset, channelCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                    &count, &gridOffset, &channelCount, &chunkCount);
+
+    if (channelCount == 0)
+      return;
+
+    // Nel Reduce-Scatter, accumiliamo in accumBuf e alla fine copiamo in outputBuf
+    T *accumBuf = (T *)work->sendbuff;
+    T *outputBuf = (T *)work->recvbuff;
+
+    ncclBineLogDirectAndAlias("reduce_scatter", work, tid);
+
+    const int nRanks = ncclShmem.comm.nRanks;
+    const int rank = ncclShmem.comm.rank;
+    const int myIndex = bine->index[rank];
+    const bool useDirect =
+        (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+    int low = 0;
+    int high = nRanks;
+
+    for (int step = 0; step < steps; ++step)
+    {
+      const int mid = (low + high) >> 1;
+      const bool keepLower = (myIndex < mid);
+      const int span = keepLower ? (high - mid) : (mid - low);
+
+      int partner = -1;
+      if (span > 0)
+      {
+        const int partnerIdx = keepLower ? myIndex + span : myIndex - span;
+        const bool partnerInOppositeHalf = keepLower ? (partnerIdx >= mid && partnerIdx < high)
+                                                     : (partnerIdx >= low && partnerIdx < mid);
+        if (partnerIdx >= 0 && partnerIdx < nRanks && partnerInOppositeHalf)
+          partner = bine->order[partnerIdx];
+      }
+
+      if (partner >= 0)
+      {
+        const int recvBegin = keepLower ? low : mid;
+        const int sendBegin = keepLower ? mid : low;
+        const bool doPost = (step == steps - 1);
+        int peers[1] = {partner};
+
+        // Logica di esecuzione "interleaved"
+        auto runStepRobust = [&](auto &prims, bool direct)
+        {
+          for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount)
+          {
+            const ssize_t dataOffset = gridOffset + elemOffset;
+            const int nelem = (int)min(chunkCount, channelCount - elemOffset);
+
+            for (int i = 0; i < span; ++i)
+            {
+              int sIdx = sendBegin + i;
+              int rIdx = recvBegin + i;
+
+              int sRank = bine->order[sIdx];
+              int rRank = bine->order[rIdx];
+
+              ssize_t sOffset = dataOffset + (ssize_t)sRank * count;
+              ssize_t rOffset = dataOffset + (ssize_t)rRank * count;
+
+              // 1. SEND (Push)
+              if (direct)
+                prims.directSendFromOutput(sOffset, nelem);
+              else
+                prims.sendFromOutput(sOffset, nelem);
+
+              // 2. RECV (Pull & Reduce)
+              if (direct)
+                prims.directRecvReduceCopy(rOffset, rOffset, nelem, doPost);
+              else
+                prims.recvReduceCopy(rOffset, rOffset, nelem, doPost);
+            }
+          }
+        };
+
+        if (useDirect)
+        {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 1, Proto, 0> prims(
+              tid, nthreads, peers, peers, accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
+          runStepRobust(prims, true);
+        }
+        else
+        {
+          Primitives<T, RedOp, FanAsymmetric<1, 1>, 0, Proto, 0> prims(
+              tid, nthreads, peers, peers, accumBuf, accumBuf, work->redOpArg, 0, 0, 0, work);
+          runStepRobust(prims, false);
+        }
+      }
+
+      // Sincronizzazione tra i thread.
+      __syncthreads();
+
+      if (keepLower)
+        high = mid;
+      else
+        low = mid;
+    }
+
+    // Copia finale dal buffer di accumulo a quello di output
+    const int finalOwnerRank = bine->order[low];
+    if (outputBuf != accumBuf)
+    {
+      const ssize_t chunkBase = (ssize_t)finalOwnerRank * count;
+      for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount)
+      {
+        const ssize_t dataOffset = gridOffset + elemOffset;
+        const int nelem = (int)min(chunkCount, channelCount - elemOffset);
+        const ssize_t dstOffset = dataOffset;
+        const ssize_t srcOffset = dataOffset + chunkBase;
+
+        for (ssize_t i = tid; i < (ssize_t)nelem; i += nthreads)
+        {
+          outputBuf[dstOffset + i] = accumBuf[srcOffset + i];
+        }
+      }
+    }
+  }
+}
+
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -75,6 +209,34 @@ template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL128> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     runRing<T, RedOp, ProtoLL128>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
+    runBine<T, RedOp, Proto>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    runBine<T, RedOp, ProtoLL>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    runBine<T, RedOp, ProtoLL128>(tid, nthreads, work);
   }
 };
 

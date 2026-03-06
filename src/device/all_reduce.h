@@ -230,6 +230,129 @@ namespace {
   }
 }
 
+template <typename T, typename RedOp, typename Proto>
+__device__ __forceinline__ void runBine(int tid, int nthreads, struct ncclDevWorkColl *work) {
+    ncclBine *bine = &ncclShmem.channel.bine;
+
+    // 1. Sanity check
+    if (bine->nSteps == 0 || bine->send == nullptr || bine->recv == nullptr) {
+      if (tid == 0)
+      {
+        printf("Bine reduce not initialized on rank %d; falling back to ring\n", ncclShmem.comm.rank);
+      }
+      runRing<T, RedOp, Proto>(tid, nthreads, work);
+      return;
+    }
+
+    // 2. Work partitioning
+    ssize_t gridOffset, channelCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T),
+                    (ssize_t *)nullptr, &gridOffset, &channelCount, &chunkCount);
+
+    T *inputBuf = (T *)work->sendbuff;
+    T *outputBuf = (T *)work->recvbuff;
+    const int rank = ncclShmem.comm.rank;
+    const int nRanks = ncclShmem.comm.nRanks;
+    const int root = work->root;
+    const bool isRoot = (rank == root);
+    const bool useDirect = (work->direct & (NCCL_P2P_READ | NCCL_P2P_WRITE)) == (NCCL_P2P_READ | NCCL_P2P_WRITE);
+
+    // Status
+    bool hasReduced = false;
+    const size_t rootOffset = ((size_t)root * nRanks + rank) * bine->nSteps;
+
+    // 3. Iterate steps in reverse (Distance Halving: Leaves -> Root)
+    for (int step = bine->nSteps - 1; step >= 0; --step)
+    {
+      const int stepIdx = rootOffset + step;
+      const int childPeer = bine->send[stepIdx];
+      const int parentPeer = bine->recv[stepIdx];
+
+      // --- Receive Step (Accumulate from Child) ---
+      if (childPeer >= 0)
+      {
+        int recvPeers[1] = {childPeer};
+        // FanAsymmetric<1, 0>: 1 Recv, 0 Send
+        if (useDirect)
+        {
+          Primitives<T, RedOp, FanAsymmetric<1, 0>, 1, Proto, 0> prim(
+              tid, nthreads, recvPeers, nullptr,
+              (hasReduced ? outputBuf : inputBuf), outputBuf,
+              work->redOpArg, 0, 0, 0, work);
+
+          for (ssize_t e = 0; e < channelCount; e += chunkCount)
+          {
+            const ssize_t off = gridOffset + e;
+            const int ne = (int)min(chunkCount, channelCount - e);
+            prim.directRecvReduceCopy(off, off, ne, /*postOp=*/false);
+          }
+        }
+        else
+        {
+          Primitives<T, RedOp, FanAsymmetric<1, 0>, 0, Proto, 0> prim(
+              tid, nthreads, recvPeers, nullptr,
+              (hasReduced ? outputBuf : inputBuf), outputBuf,
+              work->redOpArg, 0, 0, 0, work);
+
+          for (ssize_t e = 0; e < channelCount; e += chunkCount)
+          {
+            const ssize_t off = gridOffset + e;
+            const int ne = (int)min(chunkCount, channelCount - e);
+            prim.recvReduceCopy(off, off, ne, /*postOp=*/false);
+          }
+        }
+        hasReduced = true;
+      }
+
+      // --- Send Step ---
+      if (parentPeer >= 0)
+      {
+        int sendPeers[1] = {parentPeer};
+        // FanAsymmetric<0, 1>: 0 Recv, 1 Send
+        if (useDirect)
+        {
+          Primitives<T, RedOp, FanAsymmetric<0, 1>, 1, Proto, 0> prim(
+              tid, nthreads, nullptr, sendPeers,
+              (hasReduced ? outputBuf : inputBuf), nullptr,
+              work->redOpArg, 0, 0, 0, work);
+
+          for (ssize_t e = 0; e < channelCount; e += chunkCount)
+          {
+            const ssize_t off = gridOffset + e;
+            const int ne = (int)min(chunkCount, channelCount - e);
+            prim.directSend(off, off, ne);
+          }
+        }
+        else
+        {
+          Primitives<T, RedOp, FanAsymmetric<0, 1>, 0, Proto, 0> prim(
+              tid, nthreads, nullptr, sendPeers,
+              (hasReduced ? outputBuf : inputBuf), nullptr,
+              work->redOpArg, 0, 0, 0, work);
+
+          for (ssize_t e = 0; e < channelCount; e += chunkCount)
+          {
+            const ssize_t off = gridOffset + e;
+            const int ne = (int)min(chunkCount, channelCount - e);
+            prim.send(off, ne);
+          }
+        }
+      }
+
+      __syncthreads();
+    }
+
+    // 4. Final copy
+    if (isRoot && !hasReduced && inputBuf != outputBuf)
+    {
+      for (ssize_t e = tid; e < channelCount; e += nthreads)
+      {
+        outputBuf[gridOffset + e] = inputBuf[gridOffset + e];
+      }
+    }
+  }
+}
+
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -779,3 +902,32 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_TREE, NCCL_PROTO_LL128
     runTreeSplit<T, RedOp, ProtoLL128>(tid, nthreads, work);
   }
 };
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_SIMPLE>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS / ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
+    runBine<T, RedOp, Proto>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    runBine<T, RedOp, ProtoLL>(tid, nthreads, work);
+  }
+};
+
+template <typename T, typename RedOp>
+struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_BINE, NCCL_PROTO_LL128>
+{
+  __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl *work)
+  {
+    runBine<T, RedOp, ProtoLL128>(tid, nthreads, work);
+  }
+};
+

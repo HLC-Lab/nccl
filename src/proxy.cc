@@ -45,6 +45,12 @@ static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, in
   return (root != rank);
 }
 
+static inline void addUniqueBinePeer(int peer, int rank, int channelId, std::vector<int>& peers) {
+  if (peer < 0 || peer == rank) return;
+  if (std::find(peers.begin(), peers.end(), peer) != peers.end()) return;
+  peers.push_back(peer);
+}
+
 #define PROXYARGS_ALLOCATE_SIZE NCCL_MAX_OPS
 struct ncclProxyPool {
   struct ncclProxyPool *next;
@@ -585,6 +591,64 @@ static ncclResult_t SaveProxy(struct ncclComm* comm, struct ncclChannel* channel
   return ncclSuccess;
 }
 
+static ncclResult_t SaveProxyBine(struct ncclComm* comm, struct ncclChannel* channel, struct ncclProxyOp* op, bool* justInquire) {
+  const int nRanks = comm->nRanks;
+  if (nRanks <= 1) return ncclSuccess;
+
+  const int steps = channel->bine.nSteps;
+  const bool hasHalving = steps > 0 && channel->bine.host.send != nullptr && channel->bine.host.recv != nullptr;
+  const bool hasDoubling = steps > 0 && channel->bine.host.partners != nullptr;
+  if (!hasHalving && !hasDoubling) return ncclSuccess;
+
+  std::vector<int> sendPeers;
+  std::vector<int> recvPeers;
+  sendPeers.reserve(nRanks);
+  recvPeers.reserve(nRanks);
+  const int rank = comm->rank;
+
+  const bool includeBroadcastPhase =
+      (op->coll == ncclFuncBroadcast || op->coll == ncclFuncAllReduce);
+  const bool includeReducePhase =
+      (op->coll == ncclFuncReduce || op->coll == ncclFuncReduceScatter || op->coll == ncclFuncAllReduce);
+
+  int rootCount = (op->coll == ncclFuncBroadcast || op->coll == ncclFuncReduce) ? 1 : nRanks;
+  for (int rIndex = 0; rIndex < rootCount; ++rIndex) {
+    int root = (rootCount == 1) ? op->root : rIndex;
+    if (root < 0 || root >= nRanks) continue;
+    if (!hasHalving) continue;
+    const size_t rootOffset = ((size_t)root * nRanks + rank) * steps;
+    for (int step = 0; step < steps; ++step) {
+      const int stepIdx = rootOffset + step;
+      int sendPeer = channel->bine.host.send[stepIdx];
+      int recvPeer = channel->bine.host.recv[stepIdx];
+      if (includeBroadcastPhase) {
+        addUniqueBinePeer(sendPeer, rank, channel->id, sendPeers);
+        addUniqueBinePeer(recvPeer, rank, channel->id, recvPeers);
+      }
+      if (includeReducePhase) {
+        addUniqueBinePeer(sendPeer, rank, channel->id, recvPeers);
+        addUniqueBinePeer(recvPeer, rank, channel->id, sendPeers);
+      }
+    }
+  }
+
+  if (hasDoubling) {
+    for (int step = 0; step < comm->bine.nSteps; ++step) {
+      int partner = channel->bine.host.partners[rank * comm->bine.nSteps + step];
+      addUniqueBinePeer(partner, rank, channel->id, sendPeers);
+      addUniqueBinePeer(partner, rank, channel->id, recvPeers);
+    }
+  }
+
+  for (int peer : recvPeers) {
+    NCCLCHECK(SaveProxy(comm, channel, proxyRecv, peer, op, 0, justInquire));
+  }
+  for (int peer : sendPeers) {
+    NCCLCHECK(SaveProxy(comm, channel, proxySend, peer, op, 0, justInquire));
+  }
+  return ncclSuccess;
+}
+
 // justInquire != nullptr means don't actually do anything, just assertain need of
 // ncclProxySaveOp for this op.
 ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool* justInquire) {
@@ -628,6 +692,9 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
         }
         NCCLCHECK(SaveProxy(comm, channel, proxyRecv, tree->up, op, 0, justInquire));
       }
+    } break;
+  case ncclPatternBine: {
+      NCCLCHECK(SaveProxyBine(comm, channel, op, justInquire));
     } break;
   case ncclPatternCollnetChain: {
       NCCLCHECK(SaveProxy(comm, channel, proxySend, channel->collnetChain.up, op, 1, justInquire));

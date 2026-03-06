@@ -86,6 +86,7 @@ static int parseAlgorithm(const char* str) {
   if (strcmp(str, "nvls") == 0) return NCCL_ALGO_NVLS;
   if (strcmp(str, "nvls_tree") == 0) return NCCL_ALGO_NVLS_TREE;
   if (strcmp(str, "pat") == 0) return NCCL_ALGO_PAT;
+  if (strcmp(str, "bine") == 0) return NCCL_ALGO_BINE;
   return NCCL_ALGO_RING; // default
 }
 
@@ -99,6 +100,7 @@ static const char* algorithmToString(int algorithm) {
     case NCCL_ALGO_NVLS: return "nvls";
     case NCCL_ALGO_NVLS_TREE: return "nvls_tree";
     case NCCL_ALGO_PAT: return "pat";
+    case NCCL_ALGO_BINE: return "bine";
     default: return "unknown";
   }
 }
