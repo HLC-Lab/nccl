@@ -730,15 +730,16 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
         if (ps.sendDim != -1 && ps.postSend) nstepsSend[ps.sendDim]++;
       } while (ps.last != 2);
       for (int i = 0; i < log2Up(nranks); i++) {
+        // Bine schedule: round 'i' communicates with the pairwise partner
+        // binePi(rank, i); send-peer == recv-peer.
+        int peer = binePi(rank, i, nranks);
         if (nstepsSend[i]) {
-          int sendPeer = (rank - (1 << i) + nranks) % nranks;
           op->nsteps = nstepsSend[i];
-          NCCLCHECKGOTO(SaveProxy(comm, channel, proxySend, sendPeer, op, 0, justInquire), result, exit_pat_down);
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxySend, peer, op, 0, justInquire), result, exit_pat_down);
         }
         if (nstepsRecv[i]) {
-          int recvPeer = (rank + (1 << i)) % nranks;
           op->nsteps = nstepsRecv[i];
-          NCCLCHECKGOTO(SaveProxy(comm, channel, proxyRecv, recvPeer, op, 0, justInquire), result, exit_pat_down);
+          NCCLCHECKGOTO(SaveProxy(comm, channel, proxyRecv, peer, op, 0, justInquire), result, exit_pat_down);
         }
       }
     exit_pat_down:

@@ -697,31 +697,58 @@ public:
   }
 };
 
+// ---------------------------------------------------------------------------
+// Bine (binomial-negabinary) AllGather schedule.
+//
+// Instead of PAT's binomial trees over ±2^k peers, Bine uses a *pairwise*
+// (recursive-doubling-like) schedule: at each of the log2(nranks) rounds a rank
+// exchanges with a single partner, chosen by pi() below, and sends-to ==
+// receives-from the same partner.
+//
+//   rho_s = sum_{i=0..s} (-2)^i  ->  {1,-1,3,-5,11,-21,43,...}    (always odd)
+//   pi(rank, step) = (rank +/- rho_step) mod nranks  (+ for even rank, - for odd)
+//
+// Because rho_s is odd the partner always has opposite parity, which makes pi()
+// an involution: pi(pi(r,s),s) == r. That is what makes the schedule pairwise.
+// See HLC-Lab/pico libpico_allgather.c (allgather_bine_block_by_block) and the
+// Bine paper (arXiv 2508.17311). Helpers are __device__ __host__ so the same
+// code drives the device kernel and the host proxy step-counter.
+__device__ __host__ inline int bineRho(int step) {
+  int r = 1, p = 1;
+  for (int i = 1; i <= step; i++) { p *= -2; r += p; }
+  return r;
+}
+
+__device__ __host__ inline int binePi(int rank, int step, int nranks) {
+  int rho = bineRho(step);
+  int dest = ((rank & 1) == 0) ? (rank + rho) % nranks : (rank - rho) % nranks;
+  if (dest < 0) dest += nranks;
+  return dest;
+}
+
 template <typename T>
 class PatAGAlgorithm {
-  size_t offset;
-  size_t end;
-  size_t count;
+  size_t offset; // current chunk start within [0, count); advances by chunkCount
+  size_t end;    // channelOffset + channelCount
+  size_t count;  // elements per source rank (block stride in the output buffer)
   int chunkCount;
   int nelem;
   int rank;
   int nranks;
-  int nrPow2;
-  int postFreq;
-  int lastA;
+  int nsteps;          // log2(nranks)
   int parallelFactor;
-  int aggFactor;
-  int as; // aggregated steps
-  int a; // step inside aggregated step
-  int aggDelta;
-  int scale;
-  int phase;
 
-  // AS computation
-  int asDim;
-  int v;
-  int bitCount[32];
-  int bitZeroStep[32];
+  // Schedule cursor.
+  int phase;           // 0 = INIT (copy own block), 1 = ROUND (send/recv ops)
+  int step;            // current round, nsteps-1 .. 0
+  int remote;          // partner = binePi(rank, step)
+  int subPhase;        // within a round: 0 = emit a send op, 1 = emit a recv op
+  int subI, subK;      // index / number of block-pairs exchanged this round
+
+  // DFS iterator over get_indexes(rank, step)   -> the set of blocks we receive.
+  int rPend, rTop, rNode[32], rSval[32];
+  // DFS iterator over get_indexes(remote, step) -> the set of blocks we send.
+  int sPend, sTop, sNode[32], sSval[32];
 
   __device__ __host__ ssize_t min(ssize_t a, ssize_t b) {
     return (a < b) ? a : b;
@@ -731,87 +758,58 @@ class PatAGAlgorithm {
     return min(chunkCount, end - offset);
   }
 
-  __device__ __host__ int mirror(int i, int max) {
-    int ret = 0;
-    for (int mask = 1, imask = max / 2; mask < max; mask <<= 1, imask >>= 1) {
-      if ((i & mask)) ret += imask;
+  // Number of blocks exchanged (each direction) at round 'st': 2^(nsteps-1-st).
+  __device__ __host__ int roundBlocks(int st) {
+    return 1 << (nsteps - 1 - st);
+  }
+
+  // Enumerate get_indexes(start, st): the ranks reachable from 'start' by
+  // following pi() over the increasing step indices [st, nsteps). The set is
+  // produced in recursion pre-order via an explicit stack; both endpoints of a
+  // connection enumerate the same (start, st) so their FIFO ordering matches.
+  __device__ __host__ void dfsInit(int start, int st, int* pend, int* top, int* node, int* sval) {
+    if (st >= nsteps) { *pend = -1; *top = 0; return; }
+    int e0 = binePi(start, st, nranks);
+    *pend = e0;
+    node[0] = e0; sval[0] = st + 1; *top = 1;
+  }
+
+  __device__ __host__ int dfsNext(int* pend, int* top, int* node, int* sval) {
+    if (*pend >= 0) { int r = *pend; *pend = -1; return r; }
+    while (*top > 0) {
+      int y = node[*top - 1];
+      int s = sval[*top - 1];
+      if (s >= nsteps) { (*top)--; continue; }
+      sval[*top - 1] = s + 1;
+      int c = binePi(y, s, nranks);
+      node[*top] = c; sval[*top] = s + 1; (*top)++;
+      return c;
     }
-    return ret;
+    return -1;
   }
 
-  __device__ __host__ int firstBitSet(int i, int max) {
-    int ffs =
-#ifdef __CUDA_ARCH__
-      __ffs(i);
-#else
-      COMPILER_FFS(i);
-#endif
-    return ffs ? ffs - 1 : max;
-  }
-
-  __device__ __host__ void resetA() {
-    a = 0;
-    lastA = aggFactor;
-    if (phase >= 2) lastA /= 2 * scale;
-  }
-
-  __device__ __host__ void reset() {
-    nelem = getNelem();
-    scale = aggFactor / 2;
-    phase = scale ? 2 : 1;
-    v = 0;
-    for (int i = 0; i < asDim; i++) {
-      bitCount[i] = asDim - i;
-      bitZeroStep[i] = 1;
-    }
-    as = nextAs();
-    resetA();
-  }
-
-  __device__ __host__ int nextAs() {
-    for (int d = 0; d < asDim; d++) {
-      int p = 1 << d;
-      bitCount[d]--;
-      if (bitCount[d] == 0) {
-        v ^= p;
-        bitCount[d] = p;
-        if ((v & p) == 0) {
-          bitCount[d] += firstBitSet(bitZeroStep[d], asDim) - 1;
-          if (bitCount[d] == 0) {
-            v ^= p;
-            bitCount[d] = p;
-          }
-          bitZeroStep[d]++;
-        }
-      }
-    }
-    return v;
+  __device__ __host__ void startRound(int st) {
+    remote = binePi(rank, st, nranks);
+    subK = roundBlocks(st);
+    subI = 0;
+    subPhase = 0;
+    dfsInit(rank,   st, &rPend, &rTop, rNode, rSval);
+    dfsInit(remote, st, &sPend, &sTop, sNode, sSval);
   }
 
 public:
   __device__ __host__ PatAGAlgorithm(int stepSize, int stepDepth, int maxParallelFactor, size_t offset, size_t end,
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
-    parallelFactor = maxParallelFactor;
-    aggDelta = nrPow2 = (1 << log2Up(nranks));
-
-    aggFactor = 1;
-    size_t channelSize = end - offset;
-    while (stepSize / (channelSize * sizeof(T) * aggFactor) >= 2 && aggFactor < nranks / 2) {
-      aggFactor *= 2;
-      aggDelta /= 2;
-    }
-    postFreq = aggFactor;
-    if (postFreq < parallelFactor) parallelFactor = postFreq;
-    int d = stepDepth;
-    while (d > 1 && aggFactor < nranks / 2) {
-      d /= 2;
-      aggFactor *= 2;
-      aggDelta /= 2;
-    }
-
-    asDim = log2Up(aggDelta);
-    reset();
+    nsteps = log2Up(nranks);
+    // The pairwise schedule currently runs as a single worker group. Block-level
+    // pipelining still happens through the NCCL_STEPS FIFO; multi-group
+    // parallelism can be reintroduced later.
+    parallelFactor = 1;
+    (void)stepSize; (void)stepDepth; (void)maxParallelFactor;
+    nelem = getNelem();
+    phase = 0;
+    step = nsteps - 1;
   }
 
   __device__ __host__ int getParallelFactor() {
@@ -821,97 +819,68 @@ public:
   __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
     ps->last = 0;
     ps->nelem = nelem;
-    ps->inpIx = offset;
-    int skip = 0;
-    if (a >= lastA) {
-      skip = 1;
-    } else if (phase == 0) {
-      int s = a * aggDelta + as;
-      if (s >= nranks) skip = 1;
-      int recvDataRank = (rank + s) % nranks;
-      ps->outIx = recvDataRank * count + offset;
-      ps->sendDim = -1;
-      ps->recvDim = 0;
-      ps->inpIx = 0;
-      ps->sendOffset = -1;
-      ps->recvOffset = (a % postFreq) * nelem;
-      ps->stepOffset = 0;
-      ps->postRecv = (a % postFreq == postFreq - 1) || ((a + 1) * aggDelta + as >= nranks) ? 1 : 0;
-      ps->postSend = 0;
-    } else if (phase == 1) {
-      int s = a * aggDelta + as;
-      if (s >= nranks) skip = 1;
-      ps->sendDim = firstBitSet(s, nrPow2);
-      s -= (1 << ps->sendDim);
-      int sendDataRank = (rank + nranks + s) % nranks;
-      ps->outIx = sendDataRank * count + offset;
-      ps->recvDim = s ? firstBitSet(s, nrPow2) : -1;
-      ps->sendOffset = ps->recvOffset = (a % postFreq) * nelem;
-      ps->postSend = (a % postFreq == postFreq - 1) || ((a + 1) * aggDelta + as >= nranks) ? 1 : 0;
-      ps->postRecv =
-        (ps->sendDim == 0) && ((a % postFreq == postFreq - 1) || ((a + 1) * aggDelta + as - 1 >= nranks)) ? 1 : 0;
-      ps->stepOffset = (ps->sendDim == 0) ? 0 : a / postFreq;
-      if (ps->recvDim == -1) {
-        ps->recvOffset = -1;
-        ps->postRecv = 0;
-      } else if (as - (1 << ps->sendDim) == 0) {
-        int foffset = (a * aggDelta) >> (ps->recvDim + 1);
-        ps->recvOffset = (foffset % postFreq) * nelem;
-        ps->postRecv = (ps->sendDim == 0) && ((foffset % postFreq == postFreq - 1) ||
-                                              ((((foffset + 1) * 2) + 1) << ps->recvDim) >= nranks) ?
-                         1 :
-                         0;
-        ps->stepOffset = (ps->sendDim == 0) ? 0 : foffset / postFreq;
-      }
-      if (s < nranks && ps->sendDim == 0 && skip) {
-        // Don't forget to receive at least once even if we don't send afterwards
-        ps->sendDim = -1;
-        ps->sendOffset = -1;
-        ps->postSend = 0;
-        skip = 0;
-      }
-    } else if (phase == 2) {
-      int s = (2 * a + 1) * scale * aggDelta;
-      ps->postSend = (a % postFreq == postFreq - 1) || ((2 * (a + 1) + 1) * scale * aggDelta >= nranks) ? 1 : 0;
-      ps->postRecv = 0;
-      if (s >= nranks) skip = 1;
-      ps->sendDim = firstBitSet(s, nrPow2);
-      s -= (1 << ps->sendDim);
-      ps->sendOffset = (a % postFreq) * nelem;
-      ps->stepOffset = a / postFreq;
-      int sendDataRank = (rank + nranks + s) % nranks;
-      ps->outIx = sendDataRank * count + offset;
-      ps->recvDim = s ? firstBitSet(s, nrPow2) : -1;
-      if (ps->recvDim == -1) {
-        ps->recvOffset = -1;
+    ps->recvDim = -1;
+    ps->sendDim = -1;
+    ps->recvOffset = 0;
+    ps->sendOffset = 0;
+    ps->stepOffset = 0;
+    ps->postRecv = 0;
+    ps->postSend = 0;
+    ps->inpIx = 0;
+    ps->outIx = 0;
+
+    if (phase == 0) {
+      // INIT: copy this rank's own block from the input buffer to its slot in
+      // the output buffer. recvDim<0 && sendDim<0 -> patCopy reads userInput.
+      nelem = getNelem();
+      ps->nelem = nelem;
+      ps->inpIx = offset;
+      ps->outIx = (size_t)rank * count + offset;
+      if (nsteps == 0) {
+        // Single rank: nothing to communicate.
+        if (offset + chunkCount >= end) ps->last = 2;
+        else offset += chunkCount;
       } else {
-        s -= (1 << ps->recvDim);
-        int foffset = (a * 2 * scale * aggDelta) >> (ps->recvDim + 1);
-        ps->recvOffset = (foffset % postFreq) * nelem;
-        ps->stepOffset = foffset / postFreq;
+        startRound(nsteps - 1);
+        step = nsteps - 1;
+        phase = 1;
       }
-    }
-    a++;
-    if (a >= lastA && a >= parallelFactor) {
-      int p = phase;
-      if (p == 2) scale /= 2;
-      phase = p == 2 ? scale ? 2 : 1 : p == 1 ? as % 2 == 1 ? 0 : 1 : 1;
-      if (p == 0 || (p == 1 && as % 2 == 0)) as = nextAs();
-      if (p == 0 && as == aggDelta / 2) {
-        offset += chunkCount;
-        if (offset >= end) {
-          ps->last = 2;
-        } else {
-          reset();
+    } else {
+      // ROUND: interleave one send then one recv per block-pair so neither side
+      // blocks waiting on the other (both post a send before their first recv).
+      if (subPhase == 0) {
+        // SEND: forward a block we already hold (from the output buffer) to the
+        // partner. sendDim>=0 && recvDim<0 -> patCopy reads userOutput+inpIx.
+        int b = dfsNext(&sPend, &sTop, sNode, sSval);
+        ps->sendDim = step;
+        ps->inpIx = (size_t)b * count + offset;
+        ps->postSend = 1;
+        subPhase = 1;
+      } else {
+        // RECV: receive a new block from the partner into its output slot.
+        int b = dfsNext(&rPend, &rTop, rNode, rSval);
+        ps->recvDim = step;
+        ps->outIx = (size_t)b * count + offset;
+        ps->postRecv = 1;
+        subPhase = 0;
+        subI++;
+        if (subI >= subK) {
+          if (step == 0) {
+            if (offset + chunkCount >= end) {
+              ps->last = 2;
+            } else {
+              offset += chunkCount;
+              phase = 0; // next chunk starts with an INIT op
+            }
+          } else {
+            step--;
+            startRound(step);
+          }
         }
-      } else {
-        resetA();
       }
-    } else if (phase == 0 && as == 1 && offset + chunkCount >= end &&
-               a - 1 >= ((lastA - 1) / parallelFactor) * parallelFactor) {
-      ps->last = 1;
     }
-    int flags = PatUsed | (skip ? PatSkipped : 0);
+
+    int flags = PatUsed;
 #if __CUDA_ARCH__ >= 600
     cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
     a.store(flags, cuda::memory_order_release);

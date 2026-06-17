@@ -677,8 +677,12 @@ public:
       if (tid < 32 && ((1UL << tid) < nranks)) {
         int rank = ncclShmem.comm.rank;
         uint32_t delta = 1 << tid;
+        // For the Bine AllGather schedule peer slot 'tid' is the pairwise partner
+        // of round 'tid' (send-peer == recv-peer == binePi(rank, tid)); for the
+        // PAT ReduceScatter schedule it is the +/- 2^tid binomial-tree neighbour.
+        int binePeer = (mode == primsModePatAg) ? binePi(rank, tid, nranks) : 0;
         // Load recv peer
-        int recvPeer = mode == primsModePatRs ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
+        int recvPeer = mode == primsModePatRs ? (rank - delta + nranks) % nranks : binePeer;
         struct ncclPatPeer* peer = ((struct ncclPatPeer*)recvPeers) + tid;
         struct ncclConnInfo* conn = peer->conn = ncclShmem.channel.peers[recvPeer]->recv + connIndexRecv;
         peer->step = conn->step;
@@ -687,8 +691,8 @@ public:
         peer->headPtr = conn->head;
         peer->accSize = 0;
         peer->connStepSize = conn->stepSize / sizeof(T);
-        // Load send peer
-        int sendPeer = mode == primsModePatAg ? (rank - delta + nranks) % nranks : (rank + delta) % nranks;
+        // Load send peer (Bine AG: same partner as recv; PAT RS: + 2^tid)
+        int sendPeer = mode == primsModePatAg ? binePeer : (rank + delta) % nranks;
         peer = ((struct ncclPatPeer*)sendPeers) + tid;
         conn = peer->conn = ncclShmem.channel.peers[sendPeer]->send + connIndexSend;
         peer->step = conn->step;
@@ -1110,15 +1114,22 @@ public:
     }
     long long int localAccSize = shmem->localAccSize;
     if (ps->recvDim < 0 && (flags & RoleInput)) {
-      // Source is our own local buffer
-      ncclShmem.groups[group].srcs[0] = userInput + ps->inpIx;
-      if (localAccSize < ps->inpIx + nelem) {
-        // New data, copy to our output buffer.
-        ncclShmem.groups[group].dsts[1] = userOutput + ps->outIx;
-        localAccSize = ps->inpIx + nelem;
-      } else {
-        // Already done
+      if (ps->sendDim >= 0) {
+        // Bine forward-send: the block we send was already gathered into our
+        // output buffer. Source it from there and don't re-write the output.
+        ncclShmem.groups[group].srcs[0] = userOutput + ps->inpIx;
         ncclShmem.groups[group].dsts[1] = ncclShmem.groups[group].srcs[0];
+      } else {
+        // Source is our own local (input) buffer -> copy it to our output slot.
+        ncclShmem.groups[group].srcs[0] = userInput + ps->inpIx;
+        if (localAccSize < ps->inpIx + nelem) {
+          // New data, copy to our output buffer.
+          ncclShmem.groups[group].dsts[1] = userOutput + ps->outIx;
+          localAccSize = ps->inpIx + nelem;
+        } else {
+          // Already done
+          ncclShmem.groups[group].dsts[1] = ncclShmem.groups[group].srcs[0];
+        }
       }
     }
     patBarrier();
