@@ -10,11 +10,10 @@
 # either by swapping LD_LIBRARY_PATH (see run_compare.slurm).
 set -euo pipefail
 
-# --- EDIT to match `module avail cuda gcc openmpi` on Leonardo ---
 module purge
-module load cuda/12.1
-module load gcc/12.2.0
-module load openmpi/4.1.6--gcc--12.2.0
+module load cuda hpcx-mpi
+# If the NCCL/nccl-tests build complains about the C++ compiler being too old,
+# also `module load gcc/<recent>` (the system gcc on the login nodes may be old).
 
 export CUDA_HOME=${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}
 export MPI_HOME=${MPI_HOME:-$(dirname "$(dirname "$(command -v mpicc)")")}

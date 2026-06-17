@@ -1,20 +1,19 @@
 #!/bin/bash
 # AllGather benchmark on Leonardo Booster. NCCL_ALGO=PAT runs the Bine schedule.
 # Submit: sbatch bench_bine/run_allgather.slurm
-#SBATCH -A <YOUR_ACCOUNT>            # CINECA project account, e.g. -A IscrC_xxxxx
+#SBATCH -A IscrB_DEFT
 #SBATCH -p boost_usr_prod
-#SBATCH --qos boost_qos_dbg          # debug QOS: <=2 nodes, 30 min. Remove for >2 nodes (normal QOS).
-#SBATCH -N 2                         # nodes == ranks == GPUs. MUST be a power of two for Bine.
+#SBATCH -N 16                        # nodes == ranks == GPUs. MUST be a power of two for Bine.
 #SBATCH --ntasks-per-node=1          # 1 rank per node  ->  nNodes==nRanks  (PAT/Bine requirement)
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=1
 #SBATCH -t 00:30:00
 #SBATCH -o ag_bine_%j.out
 
 module purge
-module load cuda/12.1 gcc/12.2.0 openmpi/4.1.6--gcc--12.2.0
+module load cuda hpcx-mpi
 
-ROOT=$HOME/work                      # adjust if the repos live elsewhere
+ROOT=/leonardo_scratch/large/userexternal/$USER
 export NCCL_HOME=$ROOT/nccl/build
 export LD_LIBRARY_PATH=$NCCL_HOME/lib:$LD_LIBRARY_PATH
 
