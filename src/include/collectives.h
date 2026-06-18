@@ -736,23 +736,24 @@ class PatAGAlgorithm {
   int rank;
   int nranks;
   int nsteps;          // log2(nranks)
-  int parallelFactor;  // == agg: blocks packed per network message (also #worker groups)
+  int postFreq;        // blocks packed into one network message (aggregation factor)
 
-  // Schedule cursor. The op stream is a sequence of "waves" of exactly
-  // 'parallelFactor' ops; the kernel runs one wave concurrently (one op per
-  // worker group) with a global barrier between waves, so every wave must be
-  // single-direction. Layout per chunk:
-  //   INIT wave  : own-block copy + (agg-1) skip pads
-  //   per round step=nsteps-1..0, partner=binePi(rank,step), in groups of 'agg':
-  //     SEND wave: up to agg send-copies (block from output -> slot offset), one post
-  //     RECV wave: up to agg recv-copies (slot offset -> output block), one post
-  int wavePhase;       // 0 = INIT, 1 = SEND, 2 = RECV
-  int slot;            // position within the current wave, 0 .. parallelFactor-1
+  // Schedule cursor. parallelFactor is 1 (a single 512-thread worker group), so
+  // ops run strictly sequentially and there is no wave-alignment / padding.
+  // Aggregation packs up to 'postFreq' blocks into one FIFO slot (distinct byte
+  // offsets) with a single post, cutting the network message count. Layout per
+  // chunk: INIT (own-block copy); then per round step=nsteps-1..0 with partner
+  // binePi(rank,step), processed in groups of postFreq blocks: a SEND message
+  // (m forward-copies, one postSend) followed by a RECV message (m copies, one
+  // postRecv). Send-before-recv per group keeps the pairwise exchange deadlock
+  // free (both peers post their send before waiting on the matching recv).
+  int phase;           // 0 = INIT, 1 = SEND message, 2 = RECV message
   int step;            // current round, nsteps-1 .. 0
   int remote;          // partner = binePi(rank, step)
   int roundK;          // blocks exchanged (each direction) this round
-  int groupBase;       // first block index of the current group (0, agg, 2*agg, ...)
-  int groupM;          // real blocks in the current group = min(agg, roundK-groupBase)
+  int groupBase;       // first block index of the current message (0, postFreq, ...)
+  int groupM;          // blocks in the current message = min(postFreq, roundK-groupBase)
+  int idxInMsg;        // position within the current message, 0 .. groupM-1
 
   // DFS iterator over get_indexes(rank, step)   -> the set of blocks we receive.
   int rPend, rTop, rNode[32], rSval[32];
@@ -801,18 +802,11 @@ class PatAGAlgorithm {
     remote = binePi(rank, st, nranks);
     roundK = roundBlocks(st);
     groupBase = 0;
-    groupM = (int)min(parallelFactor, roundK);
-    wavePhase = 1; // SEND
-    slot = 0;
+    groupM = (int)min(postFreq, roundK);
+    idxInMsg = 0;
+    phase = 1; // SEND message
     dfsInit(rank,   st, &rPend, &rTop, rNode, rSval);
     dfsInit(remote, st, &sPend, &sTop, sNode, sSval);
-  }
-
-  // Is the op currently being emitted part of the very last wave of the whole
-  // operation (the RECV wave of the last group of round 0 of the last chunk)?
-  __device__ __host__ int inFinalWave() {
-    return wavePhase == 2 && step == 0 && groupBase + parallelFactor >= roundK &&
-           offset + chunkCount >= end;
   }
 
 public:
@@ -820,24 +814,23 @@ public:
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
     nsteps = log2Up(nranks);
-    (void)stepDepth;
-    // Aggregation factor: pack as many nelem-blocks per network message as fit a
-    // FIFO slot, capped by the worker-group budget. slotBytes and chunkCount are
-    // identical on host (proxy) and device (kernel), so 'agg' matches on both.
+    (void)stepDepth; (void)maxParallelFactor;
+    // postFreq = how many nelem-blocks fit one FIFO slot (rounded down to a power
+    // of two). slotBytes and chunkCount are identical on host (proxy) and device
+    // (kernel), so postFreq matches on both. Small/mid messages -> small chunk ->
+    // large postFreq (few messages, like PAT); large messages -> postFreq 1.
     int chunkBytes = chunkCount * (int)sizeof(T);
     int fit = chunkBytes > 0 ? slotBytes / chunkBytes : 1;
     if (fit < 1) fit = 1;
-    int agg = 1;
-    while (agg * 2 <= fit && agg * 2 <= maxParallelFactor) agg *= 2;
-    parallelFactor = agg;
+    postFreq = 1;
+    while (postFreq * 2 <= fit) postFreq *= 2;
     nelem = getNelem();
-    wavePhase = 0; // INIT
-    slot = 0;
+    phase = 0; // INIT
     step = nsteps - 1;
   }
 
   __device__ __host__ int getParallelFactor() {
-    return parallelFactor;
+    return 1;
   }
 
   __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
@@ -852,92 +845,64 @@ public:
     ps->postSend = 0;
     ps->inpIx = 0;
     ps->outIx = 0;
-    int skip = 0;
 
-    if (wavePhase == 0) {
-      // INIT wave: slot 0 copies our own block (input -> output); the remaining
-      // agg-1 slots are skip pads so the wave is full and the first SEND wave
-      // (which reads our output) lands in a later, barrier-separated wave.
-      if (slot == 0) {
-        nelem = getNelem();
-        ps->nelem = nelem;
-        ps->inpIx = offset;
-        ps->outIx = (size_t)rank * count + offset;
+    if (phase == 0) {
+      // INIT: copy this rank's own block from the input buffer to its output slot.
+      nelem = getNelem();
+      ps->nelem = nelem;
+      ps->inpIx = offset;
+      ps->outIx = (size_t)rank * count + offset;
+      if (nsteps == 0) {
+        if (offset + chunkCount >= end) ps->last = 2;  // single rank, last chunk
+        else offset += chunkCount;
       } else {
-        skip = 1;
+        startRound(nsteps - 1);
+        step = nsteps - 1;
       }
-      if (nsteps == 0 && inSingleRankFinalSlot()) ps->last = (slot == parallelFactor - 1) ? 2 : 1;
-      slot++;
-      if (slot >= parallelFactor) {
-        slot = 0;
-        if (nsteps == 0) {
-          // Single rank: only INIT waves, one per chunk.
-          if (offset + chunkCount < end) offset += chunkCount; // else: last==2 was set above
-        } else {
-          startRound(nsteps - 1);
-          step = nsteps - 1;
-        }
-      }
-    } else if (wavePhase == 1) {
-      // SEND wave: forward up to groupM already-held blocks to the partner,
-      // packed at offsets 0..groupM-1 of one FIFO slot; only the last posts.
-      if (slot < groupM) {
-        int b = dfsNext(&sPend, &sTop, sNode, sSval);
-        ps->sendDim = step;
-        ps->inpIx = (size_t)b * count + offset; // read from userOutput (forward-send)
-        ps->sendOffset = slot * nelem;
-        ps->postSend = (slot == groupM - 1) ? 1 : 0;
-      } else {
-        skip = 1;
-      }
-      slot++;
-      if (slot >= parallelFactor) { slot = 0; wavePhase = 2; } // -> RECV wave
+    } else if (phase == 1) {
+      // SEND message: forward an already-held block from the output buffer.
+      int b = dfsNext(&sPend, &sTop, sNode, sSval);
+      ps->sendDim = step;
+      ps->inpIx = (size_t)b * count + offset; // patCopy reads userOutput for forward-send
+      ps->sendOffset = idxInMsg * nelem;
+      ps->postSend = (idxInMsg == groupM - 1) ? 1 : 0;
+      idxInMsg++;
+      if (idxInMsg >= groupM) { idxInMsg = 0; phase = 2; } // -> RECV message (same group)
     } else {
-      // RECV wave: receive up to groupM new blocks from the partner.
-      if (inFinalWave()) ps->last = (slot == parallelFactor - 1) ? 2 : 1;
-      if (slot < groupM) {
-        int b = dfsNext(&rPend, &rTop, rNode, rSval);
-        ps->recvDim = step;
-        ps->outIx = (size_t)b * count + offset;
-        ps->recvOffset = slot * nelem;
-        ps->postRecv = (slot == groupM - 1) ? 1 : 0;
-      } else {
-        skip = 1;
-      }
-      slot++;
-      if (slot >= parallelFactor) {
-        slot = 0;
-        groupBase += parallelFactor;
+      // RECV message: receive a new block into its output slot.
+      int isFinal = (step == 0 && groupBase + postFreq >= roundK && idxInMsg == groupM - 1 &&
+                     offset + chunkCount >= end);
+      if (isFinal) ps->last = 2;
+      int b = dfsNext(&rPend, &rTop, rNode, rSval);
+      ps->recvDim = step;
+      ps->outIx = (size_t)b * count + offset;
+      ps->recvOffset = idxInMsg * nelem;
+      ps->postRecv = (idxInMsg == groupM - 1) ? 1 : 0;
+      idxInMsg++;
+      if (idxInMsg >= groupM) {
+        idxInMsg = 0;
+        groupBase += postFreq;
         if (groupBase < roundK) {
-          groupM = (int)min(parallelFactor, roundK - groupBase);
-          wavePhase = 1; // next group: SEND wave
+          groupM = (int)min(postFreq, roundK - groupBase);
+          phase = 1; // next group: SEND message
         } else if (step > 0) {
           step--;
-          startRound(step); // sets wavePhase = SEND
-        } else {
-          // round 0 complete -> chunk complete
-          if (offset + chunkCount < end) {
-            offset += chunkCount;
-            wavePhase = 0; // next chunk starts with an INIT wave
-          }
-          // else: this was the final wave; last was set above.
+          startRound(step); // sets phase = SEND
+        } else if (offset + chunkCount < end) {
+          offset += chunkCount;
+          phase = 0; // next chunk starts with an INIT op
         }
+        // else: round 0 of last chunk done; last==2 was set above.
       }
     }
 
-    int flags = PatUsed | (skip ? PatSkipped : 0);
+    int flags = PatUsed;
 #if __CUDA_ARCH__ >= 600
     cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
     a.store(flags, cuda::memory_order_release);
 #else
     ps->flags = flags;
 #endif
-  }
-
-private:
-  // For the single-rank case the INIT wave of the last chunk is the final wave.
-  __device__ __host__ int inSingleRankFinalSlot() {
-    return offset + chunkCount >= end;
   }
 };
 #endif
