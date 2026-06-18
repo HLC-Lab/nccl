@@ -24,4 +24,4 @@ export NCCL_PROTO=Simple
 
 # Tag the run so the output is self-describing for extract_results.py.
 echo "############## ${SLURM_JOB_NAME} (NCCL_ALGO=$ALGO  LIB=$LIB  N=$SLURM_NNODES) ##############"
-srun --mpi=pmix $ROOT/nccl-tests/build/all_gather_perf -b 8 -e 1G -f 2 -g 1 -c 1
+srun $ROOT/nccl-tests/build/all_gather_perf -b 8 -e 1G -f 2 -g 1 -c 1

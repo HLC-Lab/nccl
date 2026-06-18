@@ -26,8 +26,7 @@ export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING,NET
 
 # all_gather_perf: -b/-e size sweep, -f 2 doubling, -g 1 GPU/rank, -c 1 correctness check.
-srun --cpu-bind=cores --mpi=pmix \
+srun --cpu-bind=cores \
   $ROOT/nccl-tests/build/all_gather_perf -b 8 -e 1G -f 2 -g 1 -c 1
 
-# If srun rejects --mpi=pmix, try --mpi=pmi2.
 # Read the 'busbw' (GB/s) column for bandwidth; 'Out of bounds values: 0 OK' = correctness pass.

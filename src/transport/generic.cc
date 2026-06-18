@@ -8,6 +8,7 @@
 #include "comm.h"
 #include "transport.h"
 #include "bootstrap.h"
+#include "collectives.h"  // binePi() for the Bine AllGather peer connections
 
 NCCL_PARAM(MultiSegmentRegister, "MULTI_SEGMENT_REGISTER", 1);
 
@@ -69,17 +70,27 @@ fail:
 ncclResult_t ncclTransportPatConnect(struct ncclComm* comm) {
   ncclResult_t ret = ncclSuccess;
   if (comm && comm->nRanks > 1) {
-    for (int mask = 1; mask < comm->nRanks; mask <<= 1) {
+    // ReduceScatter still uses the PAT binomial-tree (+/- 2^i) peers; AllGather
+    // now uses the Bine pairwise schedule, whose round-i partner is binePi(rank,i)
+    // (same peer for send and recv). binePi requires a power-of-two rank count;
+    // for non-po2 the AllGather PAT path is disabled (falls back to Ring), so we
+    // only set up its connections when nRanks is a power of two.
+    const bool po2 = (comm->nRanks & (comm->nRanks - 1)) == 0;
+    int step = 0;
+    for (int mask = 1; mask < comm->nRanks; mask <<= 1, step++) {
       int prevPeer = (comm->rank + mask) % comm->nRanks;
       int nextPeer = (comm->rank + comm->nRanks - mask) % comm->nRanks;
       for (int c = 0; c < comm->nChannels; c++) {
         NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &prevPeer, 1, &nextPeer, 0), ret, fail); // ReduceScatter
       }
       NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_TREE], 0), ret, fail);
-      for (int c = 0; c < comm->nChannels; c++) {
-        NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &nextPeer, 1, &prevPeer, 0), ret, fail); // AllGather
+      if (po2) {
+        int binePeer = binePi(comm->rank, step, comm->nRanks);
+        for (int c = 0; c < comm->nChannels; c++) {
+          NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &binePeer, 1, &binePeer, 0), ret, fail); // AllGather (Bine)
+        }
+        NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_TREE], 0), ret, fail);
       }
-      NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_TREE], 0), ret, fail);
     }
     INFO(NCCL_INIT, "Connected binomial trees");
   }

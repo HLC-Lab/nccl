@@ -28,7 +28,7 @@ run() {  # label  libdir  algo  -- all three steps share THIS single allocation 
   echo "############## $1 (NCCL_ALGO=$3) ##############"
   local try=0
   until LD_LIBRARY_PATH=$2:$LD_LIBRARY_PATH NCCL_ALGO=$3 \
-          srun --cpu-bind=cores --mpi=pmix $TESTS $SWEEP; do
+          srun --cpu-bind=cores $TESTS $SWEEP; do
     try=$((try+1))
     [ $try -ge 3 ] && { echo "!! $1: srun failed after $try attempts, skipping"; break; }
     echo "!! $1: srun launch failed, retry $try/3 after 20s..."; sleep 20
@@ -43,4 +43,3 @@ run RING $BASE_LIB RING    # Ring (unchanged; baseline or bine identical)
 
 # Compare the 'busbw' (GB/s) column across the three blocks at matching sizes.
 # 'Out of bounds values: 0 OK' on the BINE block = correctness pass.
-# If srun rejects --mpi=pmix, try --mpi=pmi2.
