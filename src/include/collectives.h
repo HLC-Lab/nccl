@@ -726,39 +726,46 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
+// Bine "2_blocks" AllGather (libpico allgather_bine_2_blocks): natural-order, no
+// permutation. Each rank holds a contiguous (mod-wraparound) range of source
+// blocks and DOUBLES it each step by exchanging 'mask' blocks with partner
+// binePi(rank,step). mask = 1,2,4,...; the held range grows right or left
+// depending on (step parity == rank parity). vs block_by_block this sends
+// CONTIGUOUS source ranges instead of scattered sets.
 template <typename T>
 class PatAGAlgorithm {
   size_t offset; // current chunk start within [0, count); advances by chunkCount
   size_t end;    // channelOffset + channelCount
   size_t count;  // elements per source rank (block stride in the output buffer)
   int chunkCount;
-  int nelem;
+  int nelem;     // elements per block-slice this chunk (== chunkCount, clamped)
   int rank;
   int nranks;
-  int nsteps;          // log2(nranks)
-  int postFreq;        // blocks packed into one network message (aggregation factor)
+  int nsteps;        // log2(nranks)
+  int slotElems;     // FIFO slot capacity in elements
+  int flat;          // 1 when chunkCount==count: consecutive blocks are contiguous in
+                     // memory -> one coalesced copy per slot (the win); else per-block.
 
-  // Schedule cursor. parallelFactor is 1 (a single 512-thread worker group), so
-  // ops run strictly sequentially and there is no wave-alignment / padding.
-  // Aggregation packs up to 'postFreq' blocks into one FIFO slot (distinct byte
-  // offsets) with a single post, cutting the network message count. Layout per
-  // chunk: INIT (own-block copy); then per round step=nsteps-1..0 with partner
-  // binePi(rank,step), processed in groups of postFreq blocks: a SEND message
-  // (m forward-copies, one postSend) followed by a RECV message (m copies, one
-  // postRecv). Send-before-recv per group keeps the pairwise exchange deadlock
-  // free (both peers post their send before waiting on the matching recv).
-  int phase;           // 0 = INIT, 1 = SEND message, 2 = RECV message
-  int step;            // current round, nsteps-1 .. 0
-  int remote;          // partner = binePi(rank, step)
-  int roundK;          // blocks exchanged (each direction) this round
-  int groupBase;       // first block index of the current message (0, postFreq, ...)
-  int groupM;          // blocks in the current message = min(postFreq, roundK-groupBase)
-  int idxInMsg;        // position within the current message, 0 .. groupM-1
+  // parallelFactor is 1 (single 512-thread group, sequential ops). Layout per
+  // chunk: INIT (own-block copy); then step=0..nsteps-1 (mask doubling), partner
+  // binePi(rank,step): a SEND of the contiguous held range [sendIndex,+mask) then
+  // a RECV of [recvIndex,+mask). Send-before-recv keeps the pairwise exchange
+  // deadlock free. A "message" (one post) is one slot-sized contiguous run-piece
+  // (flat) or one block (strided).
+  int phase;         // 0 = INIT, 1 = SEND, 2 = RECV
+  int step;          // current step, 0 .. nsteps-1
+  int mask;          // blocks exchanged this step (1,2,4,...)
+  int myFirst;       // start block of our contiguous held range
+  int sendIndex;     // start block of the range we send this step
+  int recvIndex;     // start block of the range we receive this step
 
-  // DFS iterator over get_indexes(rank, step)   -> the set of blocks we receive.
-  int rPend, rTop, rNode[32], rSval[32];
-  // DFS iterator over get_indexes(remote, step) -> the set of blocks we send.
-  int sPend, sTop, sNode[32], sSval[32];
+  // Emission cursor over the current phase's block range [rangeStart, +mask).
+  int rangeStart;
+  int blkIdx;        // strided: block within range, 0 .. mask-1
+  int runStart;        // flat: first block of the current contiguous (pre-wrap) run
+  int runBlocks;       // flat: blocks in the current run
+  size_t runElemDone;  // flat: elements emitted from the current run
+  int blocksLeft;      // flat: blocks of the range not yet started
 
   __device__ __host__ ssize_t min(ssize_t a, ssize_t b) {
     return (a < b) ? a : b;
@@ -768,45 +775,27 @@ class PatAGAlgorithm {
     return min(chunkCount, end - offset);
   }
 
-  // Number of blocks exchanged (each direction) at round 'st': 2^(nsteps-1-st).
-  __device__ __host__ int roundBlocks(int st) {
-    return 1 << (nsteps - 1 - st);
+  // Begin emitting the block range [rstart, rstart+mask) (mod nranks).
+  __device__ __host__ void beginRange(int rstart) {
+    rangeStart = rstart;
+    blkIdx = 0;
+    blocksLeft = mask;
+    runStart = rstart;
+    runBlocks = (int)min(blocksLeft, nranks - runStart); // contiguous until wraparound
+    runElemDone = 0;
   }
 
-  // Enumerate get_indexes(start, st): the ranks reachable from 'start' by
-  // following pi() over the increasing step indices [st, nsteps). The set is
-  // produced in recursion pre-order via an explicit stack; both endpoints of a
-  // connection enumerate the same (start, st) so their FIFO ordering matches.
-  __device__ __host__ void dfsInit(int start, int st, int* pend, int* top, int* node, int* sval) {
-    if (st >= nsteps) { *pend = -1; *top = 0; return; }
-    int e0 = binePi(start, st, nranks);
-    *pend = e0;
-    node[0] = e0; sval[0] = st + 1; *top = 1;
-  }
-
-  __device__ __host__ int dfsNext(int* pend, int* top, int* node, int* sval) {
-    if (*pend >= 0) { int r = *pend; *pend = -1; return r; }
-    while (*top > 0) {
-      int y = node[*top - 1];
-      int s = sval[*top - 1];
-      if (s >= nsteps) { (*top)--; continue; }
-      sval[*top - 1] = s + 1;
-      int c = binePi(y, s, nranks);
-      node[*top] = c; sval[*top] = s + 1; (*top)++;
-      return c;
+  // Compute send/recv block ranges for 'st' and begin the SEND range.
+  __device__ __host__ void startStep(int st) {
+    sendIndex = myFirst;
+    if (((st & 1) == (rank & 1))) {
+      recvIndex = (sendIndex + mask) % nranks;       // grow range to the right
+    } else {
+      recvIndex = (sendIndex - mask + nranks) % nranks; // grow range to the left
+      myFirst = recvIndex;
     }
-    return -1;
-  }
-
-  __device__ __host__ void startRound(int st) {
-    remote = binePi(rank, st, nranks);
-    roundK = roundBlocks(st);
-    groupBase = 0;
-    groupM = (int)min(postFreq, roundK);
-    idxInMsg = 0;
-    phase = 1; // SEND message
-    dfsInit(rank,   st, &rPend, &rTop, rNode, rSval);
-    dfsInit(remote, st, &sPend, &sTop, sNode, sSval);
+    phase = 1; // SEND
+    beginRange(sendIndex);
   }
 
 public:
@@ -815,18 +804,14 @@ public:
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
     nsteps = log2Up(nranks);
     (void)stepDepth; (void)maxParallelFactor;
-    // postFreq = how many nelem-blocks fit one FIFO slot (rounded down to a power
-    // of two). slotBytes and chunkCount are identical on host (proxy) and device
-    // (kernel), so postFreq matches on both. Small/mid messages -> small chunk ->
-    // large postFreq (few messages, like PAT); large messages -> postFreq 1.
-    int chunkBytes = chunkCount * (int)sizeof(T);
-    int fit = chunkBytes > 0 ? slotBytes / chunkBytes : 1;
-    if (fit < 1) fit = 1;
-    postFreq = 1;
-    while (postFreq * 2 <= fit) postFreq *= 2;
+    slotElems = slotBytes / (int)sizeof(T);
+    if (slotElems < 1) slotElems = 1;
+    flat = ((size_t)chunkCount == count) ? 1 : 0; // whole-block chunks -> contiguous runs
     nelem = getNelem();
     phase = 0; // INIT
     step = nsteps - 1;
+    mask = 1;
+    myFirst = rank;
   }
 
   __device__ __host__ int getParallelFactor() {
@@ -847,7 +832,7 @@ public:
     ps->outIx = 0;
 
     if (phase == 0) {
-      // INIT: copy this rank's own block from the input buffer to its output slot.
+      // INIT: copy this rank's own block to its natural output slot.
       nelem = getNelem();
       ps->nelem = nelem;
       ps->inpIx = offset;
@@ -856,43 +841,73 @@ public:
         if (offset + chunkCount >= end) ps->last = 2;  // single rank, last chunk
         else offset += chunkCount;
       } else {
-        startRound(nsteps - 1);
-        step = nsteps - 1;
+        step = 0;
+        mask = 1;
+        myFirst = rank;
+        startStep(0);
       }
-    } else if (phase == 1) {
-      // SEND message: forward an already-held block from the output buffer.
-      int b = dfsNext(&sPend, &sTop, sNode, sSval);
-      ps->sendDim = step;
-      ps->inpIx = (size_t)b * count + offset; // patCopy reads userOutput for forward-send
-      ps->sendOffset = idxInMsg * nelem;
-      ps->postSend = (idxInMsg == groupM - 1) ? 1 : 0;
-      idxInMsg++;
-      if (idxInMsg >= groupM) { idxInMsg = 0; phase = 2; } // -> RECV message (same group)
+      int flags = PatUsed;
+#if __CUDA_ARCH__ >= 600
+      cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
+      a.store(flags, cuda::memory_order_release);
+#else
+      ps->flags = flags;
+#endif
+      return;
+    }
+
+    int send = (phase == 1);
+    ps->sendDim = send ? step : -1;
+    ps->recvDim = send ? -1 : step;
+
+    int phaseDone = 0;
+    if (flat) {
+      // One coalesced contiguous copy per slot, spanning whole blocks.
+      int pieceElems = (int)min(slotElems, runBlocks * (size_t)count - runElemDone);
+      size_t ix = (size_t)runStart * count + offset + runElemDone;
+      ps->nelem = pieceElems;
+      if (send) ps->inpIx = ix; else ps->outIx = ix;  // patCopy: send reads output, recv writes output
+      ps->postSend = send ? 1 : 0;
+      ps->postRecv = send ? 0 : 1;
+      runElemDone += pieceElems;
+      if (runElemDone >= runBlocks * (size_t)count) {     // run complete
+        blocksLeft -= runBlocks;
+        if (blocksLeft > 0) {
+          runStart = (runStart + runBlocks) % nranks;
+          runBlocks = (int)min(blocksLeft, nranks - runStart);
+          runElemDone = 0;
+        } else {
+          phaseDone = 1;
+        }
+      }
     } else {
-      // RECV message: receive a new block into its output slot.
-      int isFinal = (step == 0 && groupBase + postFreq >= roundK && idxInMsg == groupM - 1 &&
-                     offset + chunkCount >= end);
-      if (isFinal) ps->last = 2;
-      int b = dfsNext(&rPend, &rTop, rNode, rSval);
-      ps->recvDim = step;
-      ps->outIx = (size_t)b * count + offset;
-      ps->recvOffset = idxInMsg * nelem;
-      ps->postRecv = (idxInMsg == groupM - 1) ? 1 : 0;
-      idxInMsg++;
-      if (idxInMsg >= groupM) {
-        idxInMsg = 0;
-        groupBase += postFreq;
-        if (groupBase < roundK) {
-          groupM = (int)min(postFreq, roundK - groupBase);
-          phase = 1; // next group: SEND message
-        } else if (step > 0) {
-          step--;
-          startRound(step); // sets phase = SEND
+      // Strided: one op per block (chunkCount elements at block*count+offset).
+      int b = (rangeStart + blkIdx) % nranks;
+      ps->nelem = nelem;
+      if (send) ps->inpIx = (size_t)b * count + offset; else ps->outIx = (size_t)b * count + offset;
+      ps->postSend = send ? 1 : 0;
+      ps->postRecv = send ? 0 : 1;
+      blkIdx++;
+      if (blkIdx >= mask) phaseDone = 1;
+    }
+
+    if (phaseDone) {
+      if (send) {
+        phase = 2;           // SEND range done -> RECV range
+        beginRange(recvIndex);
+      } else {
+        // RECV range done -> next step, or next chunk, or finished. Decide the
+        // terminal case from the current (pre-advance) step/offset.
+        if (step < nsteps - 1) {
+          step++;
+          mask <<= 1;
+          startStep(step);
         } else if (offset + chunkCount < end) {
           offset += chunkCount;
-          phase = 0; // next chunk starts with an INIT op
+          phase = 0;         // next chunk starts with an INIT op
+        } else {
+          ps->last = 2;      // final op of the whole operation
         }
-        // else: round 0 of last chunk done; last==2 was set above.
       }
     }
 
