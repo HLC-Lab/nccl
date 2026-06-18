@@ -135,8 +135,9 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
 
     if (tid == nworkers) {
       // Algo computation thread
-      PatAGAlgorithm<T> patAlgo(chunkCount * sizeof(T), NCCL_STEPS, NCCL_PAT_NWORKERS / WARP_SIZE, channelOffset,
-                                channelOffset + channelCount, count, chunkCount, rank, nranks);
+      PatAGAlgorithm<T> patAlgo(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, NCCL_STEPS,
+                                NCCL_PAT_NWORKERS / WARP_SIZE, channelOffset, channelOffset + channelCount, count,
+                                chunkCount, rank, nranks);
       int parallelFactor = shmem->parallelFactor = patAlgo.getParallelFactor();
       int step = 0;
       while (1) {
