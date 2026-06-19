@@ -737,13 +737,19 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // 2^(nsteps-1-step) (scattered) blocks, enumerated by an explicit-stack DFS so both
 // endpoints of a connection produce the identical order (FIFO-consistent).
 //
-// Concurrency model (PAT-style aggregation, the only race-free form for a pairwise
-// butterfly): a "message" packs up to postFreq block-slices into ONE FIFO slot at
-// byte offsets 0,nelem,2*nelem,... with a SINGLE post. parallelFactor == postFreq,
-// so the postFreq copies of a message run concurrently across worker groups while
-// exactly one advances peer->step (no race). The op stream is waves of exactly
-// postFreq ops; each wave is single-direction (all sends / all recvs / the INIT) so
-// it never deadlocks and has no intra-wave output hazard. nelem == chunkCount.
+// Concurrency model (PAT-style aggregation + SUB-CHUNKING, the race-free way to get
+// full concurrency out of a pairwise butterfly): each block-slice (nelem elements)
+// is split into K SUB-SLICES of sliceElems elements. A "message" packs up to
+// postFreq sub-slices into ONE FIFO slot at byte offsets 0,sliceElems,2*sliceElems,
+// ... with a SINGLE post. parallelFactor == postFreq, so the postFreq sub-copies run
+// concurrently across worker groups while exactly one advances peer->step (no race).
+// sliceElems is chosen so postFreq reaches maxParallelFactor even when chunkCount is
+// large (where plain block packing would give postFreq=1): at large messages a block
+// is sub-chunked (K>1) to refill in-flight depth; at small messages sliceElems ==
+// chunkCount (K=1). This adds NO extra barriers vs the K=1 case -- the message-wave
+// COUNT is unchanged, each wave just carries postFreq concurrent sub-copies instead
+// of 1. The op stream is waves of exactly postFreq ops; each wave is single-direction
+// (all sends / all recvs / the INIT) so it never deadlocks and has no output hazard.
 template <typename T>
 class PatAGAlgorithm {
   size_t offset; // current chunk start within [0, count); advances by chunkCount
@@ -754,20 +760,25 @@ class PatAGAlgorithm {
   int rank;
   int nranks;
   int nsteps;        // log2(nranks)
-  int postFreq;      // block-slices packed per message == parallelFactor (#worker groups)
+  int postFreq;      // sub-slices packed per message == parallelFactor (#worker groups)
+  int sliceElems;    // elements per sub-slice (packing/concurrency unit, <= chunkCount)
+  int K;             // sub-slices per block-slice this chunk = ceil(nelem/sliceElems)
 
   // Schedule cursor. Layout per chunk: INIT wave (own-block copy + postFreq-1 skip
   // pads); then step = nsteps-1 .. 0, partner binePi(rank,step): a SEND phase of the
   // send-set get_indexes(remote,step) then a RECV phase of the recv-set
-  // get_indexes(rank,step). Each phase = ceil(roundK/postFreq) message-waves, the
-  // last skip-padded up to postFreq.
+  // get_indexes(rank,step). Each phase has roundK blocks * K sub-slices = totalSlices
+  // sub-slices, emitted as ceil(totalSlices/postFreq) message-waves (last padded).
   int phase;         // 0 = INIT, 1 = SEND, 2 = RECV
   int step;          // current round, nsteps-1 .. 0  (distant -> near as it counts down)
   int remote;        // partner = binePi(rank, step)
   int roundK;        // blocks exchanged each direction this round = 2^(nsteps-1-step)
-  int msgBase;       // block index within [0,roundK) at the start of the current wave
+  int totalSlices;   // sub-slices this phase = roundK * K
+  int sliceIdx;      // real sub-slices emitted so far in this phase, 0 .. totalSlices
+  int sliceBase;     // sliceIdx at the start of the current wave
+  int curBlock;      // current DFS block (its K sub-slices are emitted consecutively)
   int pos;           // position within the current wave, 0 .. postFreq-1
-  int m;             // real block-slices in the current message = min(postFreq, roundK-msgBase)
+  int m;             // real sub-slices in the current message = min(postFreq, totalSlices-sliceBase)
 
   // DFS iterator over get_indexes(rank,step)   -> blocks we RECEIVE.
   int rPend, rTop, rNode[32], rSval[32];
@@ -780,6 +791,11 @@ class PatAGAlgorithm {
 
   __device__ __host__ int getNelem() {
     return min(chunkCount, end - offset);
+  }
+
+  // Sub-slices needed to cover 'ne' elements at sliceElems granularity.
+  __device__ __host__ int subCount(int ne) {
+    return (ne + sliceElems - 1) / sliceElems;
   }
 
   // Enumerate get_indexes(start, st) in recursion pre-order via an explicit stack.
@@ -811,9 +827,12 @@ class PatAGAlgorithm {
     dfsInit(rank,   st, &rPend, &rTop, rNode, rSval); // recv set
     dfsInit(remote, st, &sPend, &sTop, sNode, sSval); // send set
     phase = 1; // SEND
-    msgBase = 0;
+    totalSlices = roundK * K;
+    sliceIdx = 0;
+    sliceBase = 0;
+    curBlock = -1;
     pos = 0;
-    m = (int)min(postFreq, roundK);
+    m = (int)min(postFreq, totalSlices);
   }
 
 public:
@@ -822,17 +841,34 @@ public:
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
     nsteps = log2Up(nranks);
     (void)stepDepth;
-    // postFreq = how many nelem-slices fit one FIFO slot, capped by the worker-group
-    // budget (maxParallelFactor). Power of two so it cleanly divides the worker pool.
-    // slotBytes and chunkCount are identical on host (proxy) and device (kernel) so
-    // postFreq matches. Small/mid messages -> small chunk -> large postFreq (high
-    // concurrency, where the PAT gap is worst); large messages -> postFreq -> 1.
-    int chunkBytes = chunkCount * (int)sizeof(T);
-    int fit = chunkBytes > 0 ? slotBytes / chunkBytes : 1;
-    if (fit < 1) fit = 1;
-    postFreq = 1;
-    while (postFreq * 2 <= fit && postFreq * 2 <= maxParallelFactor) postFreq *= 2;
+    // Pick sliceElems so postFreq (sub-slices per slot) reaches maxParallelFactor,
+    // keeping sliceElems as LARGE as possible (fewest sub-slices) to minimise op
+    // count. Start at the full block-slice; halve while it still divides evenly and
+    // we have not yet reached the worker-group budget.
+    //
+    // Host(proxy, T=char, byte units)/device(kernel, T, element units) consistency:
+    // slotBytes is identical; chunkCount is in each side's units with
+    // chunkCount_char = chunkCount_T * sizeof(T). postFreq matches at every halving
+    // step by floor(floor(slotBytes/sizeof(T))/s) == floor(slotBytes/(sizeof(T)*s)),
+    // so both sides take the same number of halvings -> sliceElems_char ==
+    // sliceElems_T * sizeof(T), making all slot/block byte offsets agree. chunkCount
+    // is always a multiple of 512/sizeof(T) >= 64 (ncclCollCbdPart grain), and
+    // K = chunkCount/sliceElems <= maxParallelFactor <= 16, so K always divides
+    // chunkCount evenly and postFreq is reached before the even-check can bite.
+    int slotElems = slotBytes / (int)sizeof(T);
+    if (slotElems < 1) slotElems = 1;
+    sliceElems = chunkCount > 0 ? chunkCount : 1;
+    postFreq = slotElems / sliceElems;
+    if (postFreq < 1) postFreq = 1;
+    while (postFreq < maxParallelFactor && (sliceElems & 1) == 0 && sliceElems >= 2) {
+      sliceElems /= 2;
+      postFreq = slotElems / sliceElems;
+    }
+    if (postFreq > maxParallelFactor) postFreq = maxParallelFactor;
+    if (postFreq < 1) postFreq = 1;
+    if (sliceElems < 1) sliceElems = 1;
     nelem = getNelem();
+    K = subCount(nelem);
     phase = 0; // INIT
     pos = 0;
     step = nsteps - 1;
@@ -857,11 +893,12 @@ public:
     int skip = 0;
 
     if (phase == 0) {
-      // INIT wave: pos 0 copies our own block; pos 1..postFreq-1 are skip pads so
-      // the first SEND wave (which reads our output) lands in a later, barrier-
-      // separated wave.
+      // INIT wave: pos 0 copies our own (whole) block-slice; pos 1..postFreq-1 are
+      // skip pads so the first SEND wave (which reads our output) lands in a later,
+      // barrier-separated wave. The local copy is not sub-chunked.
       if (pos == 0) {
         nelem = getNelem();
+        K = subCount(nelem);
         ps->nelem = nelem;
         ps->inpIx = offset;
         ps->outIx = (size_t)rank * count + offset;
@@ -880,26 +917,32 @@ public:
         }
       }
     } else {
-      // SEND (phase 1) or RECV (phase 2) message-wave. pos 0..m-1 are real slices
-      // packed at byte offset pos*nelem of one FIFO slot; only pos==m-1 posts.
+      // SEND (phase 1) or RECV (phase 2) message-wave. pos 0..m-1 are real sub-slices
+      // packed at byte offset pos*sliceElems of one FIFO slot; only pos==m-1 posts.
       int send = (phase == 1);
-      // Final op of the whole operation: RECV wave of the last message of the last
+      // Final op of the whole operation: last wave of the RECV phase of the last
       // round (step 0, nearest peer) of the last chunk.
-      int isFinalWave = (!send && step == 0 && offset + chunkCount >= end && msgBase + postFreq >= roundK);
+      int isFinalWave = (!send && step == 0 && offset + chunkCount >= end && sliceBase + postFreq >= totalSlices);
       if (pos < m) {
-        int b = send ? dfsNext(&sPend, &sTop, sNode, sSval) : dfsNext(&rPend, &rTop, rNode, rSval);
-        ps->nelem = nelem;
+        int sub = sliceIdx % K;                   // sub-slice index within the block
+        if (sub == 0) {                           // first sub-slice of a block -> pull next block
+          curBlock = send ? dfsNext(&sPend, &sTop, sNode, sSval) : dfsNext(&rPend, &rTop, rNode, rSval);
+        }
+        int subOff = sub * sliceElems;
+        int subNelem = (int)min(sliceElems, nelem - subOff);
+        ps->nelem = subNelem;
         if (send) {
           ps->sendDim = step;
-          ps->inpIx = (size_t)b * count + offset; // patCopy reads userOutput (forward-send)
-          ps->sendOffset = pos * nelem;
+          ps->inpIx = (size_t)curBlock * count + offset + subOff; // patCopy reads userOutput
+          ps->sendOffset = pos * sliceElems;
           ps->postSend = (pos == m - 1) ? 1 : 0;
         } else {
           ps->recvDim = step;
-          ps->outIx = (size_t)b * count + offset;
-          ps->recvOffset = pos * nelem;
+          ps->outIx = (size_t)curBlock * count + offset + subOff;
+          ps->recvOffset = pos * sliceElems;
           ps->postRecv = (pos == m - 1) ? 1 : 0;
         }
+        sliceIdx++;
       } else {
         skip = 1;
       }
@@ -907,13 +950,15 @@ public:
       pos++;
       if (pos >= postFreq) {           // wave complete
         pos = 0;
-        msgBase += postFreq;
-        if (msgBase < roundK) {        // more messages in this phase
-          m = (int)min(postFreq, roundK - msgBase);
+        sliceBase = sliceIdx;
+        if (sliceIdx < totalSlices) {  // more messages in this phase
+          m = (int)min(postFreq, totalSlices - sliceIdx);
         } else if (send) {             // SEND phase done -> RECV phase (recv-set already DFS-inited)
           phase = 2;
-          msgBase = 0;
-          m = (int)min(postFreq, roundK);
+          sliceIdx = 0;
+          sliceBase = 0;
+          curBlock = -1;
+          m = (int)min(postFreq, totalSlices);
         } else if (step > 0) {         // RECV done -> next round (closer peer, double volume)
           step--;
           startStep(step);
