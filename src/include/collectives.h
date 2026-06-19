@@ -726,20 +726,24 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
-// Bine "2_blocks" AllGather (libpico allgather_bine_2_blocks): natural-order, no
-// permutation. Each rank holds a contiguous (mod-wraparound) range of source
-// blocks and DOUBLES it each step by exchanging 'mask' blocks with partner
-// binePi(rank,step). mask = 1,2,4,...; the held range grows right or left
-// depending on (step parity == rank parity).
+// Bine AllGather (libpico allgather_bine_block_by_block) with correct LOCALITY:
+// rounds go step = nsteps-1 .. 0, so the FIRST round exchanges the SMALLEST volume
+// (1 block) with the FARTHEST peer and the LAST round exchanges the LARGEST volume
+// (n/2 blocks) with the NEAREST peer (binePi(rank,0) = rank +/- 1). This is Bine's
+// design intent: keep the heavy transfers on short/fast links. (The earlier
+// "2_blocks" ordering had this BACKWARDS -- largest volume to the farthest peer.)
+// Per round 'step', partner = binePi(rank,step); the rank RECEIVES the block set
+// get_indexes(rank,step) and SENDS get_indexes(remote,step); both sets have
+// 2^(nsteps-1-step) (scattered) blocks, enumerated by an explicit-stack DFS so both
+// endpoints of a connection produce the identical order (FIFO-consistent).
 //
-// Concurrency model (PAT-style aggregation, the only safe form for a pairwise
+// Concurrency model (PAT-style aggregation, the only race-free form for a pairwise
 // butterfly): a "message" packs up to postFreq block-slices into ONE FIFO slot at
 // byte offsets 0,nelem,2*nelem,... with a SINGLE post. parallelFactor == postFreq,
 // so the postFreq copies of a message run concurrently across worker groups while
-// exactly one of them advances peer->step (no peer->step race). The op stream is a
-// sequence of "waves" of exactly postFreq ops; each wave is single-direction (all
-// sends, or all recvs, or the INIT) so it never deadlocks and never has an
-// intra-wave output hazard. nelem == chunkCount (<= slot), never a large flat copy.
+// exactly one advances peer->step (no race). The op stream is waves of exactly
+// postFreq ops; each wave is single-direction (all sends / all recvs / the INIT) so
+// it never deadlocks and has no intra-wave output hazard. nelem == chunkCount.
 template <typename T>
 class PatAGAlgorithm {
   size_t offset; // current chunk start within [0, count); advances by chunkCount
@@ -753,20 +757,22 @@ class PatAGAlgorithm {
   int postFreq;      // block-slices packed per message == parallelFactor (#worker groups)
 
   // Schedule cursor. Layout per chunk: INIT wave (own-block copy + postFreq-1 skip
-  // pads); then step=0..nsteps-1 (mask doubling), partner binePi(rank,step): a SEND
-  // phase of the contiguous range [sendIndex,+mask) then a RECV phase of
-  // [recvIndex,+mask). Each phase is emitted as ceil(mask/postFreq) message-waves;
-  // the last wave is skip-padded up to postFreq.
+  // pads); then step = nsteps-1 .. 0, partner binePi(rank,step): a SEND phase of the
+  // send-set get_indexes(remote,step) then a RECV phase of the recv-set
+  // get_indexes(rank,step). Each phase = ceil(roundK/postFreq) message-waves, the
+  // last skip-padded up to postFreq.
   int phase;         // 0 = INIT, 1 = SEND, 2 = RECV
-  int step;          // current step, 0 .. nsteps-1
-  int mask;          // blocks exchanged this step (1,2,4,...)
-  int myFirst;       // start block of our contiguous held range
-  int sendIndex;     // start block of the range we send this step
-  int recvIndex;     // start block of the range we receive this step
-  int rangeStart;    // start block of the phase's range (sendIndex or recvIndex)
-  int msgBase;       // block index within [0,mask) at the start of the current wave
+  int step;          // current round, nsteps-1 .. 0  (distant -> near as it counts down)
+  int remote;        // partner = binePi(rank, step)
+  int roundK;        // blocks exchanged each direction this round = 2^(nsteps-1-step)
+  int msgBase;       // block index within [0,roundK) at the start of the current wave
   int pos;           // position within the current wave, 0 .. postFreq-1
-  int m;             // real block-slices in the current message = min(postFreq, mask-msgBase)
+  int m;             // real block-slices in the current message = min(postFreq, roundK-msgBase)
+
+  // DFS iterator over get_indexes(rank,step)   -> blocks we RECEIVE.
+  int rPend, rTop, rNode[32], rSval[32];
+  // DFS iterator over get_indexes(remote,step) -> blocks we SEND.
+  int sPend, sTop, sNode[32], sSval[32];
 
   __device__ __host__ ssize_t min(ssize_t a, ssize_t b) {
     return (a < b) ? a : b;
@@ -776,20 +782,38 @@ class PatAGAlgorithm {
     return min(chunkCount, end - offset);
   }
 
-  // Compute send/recv ranges for step 'st' and begin its SEND phase.
-  __device__ __host__ void startStep(int st) {
-    sendIndex = myFirst;
-    if (((st & 1) == (rank & 1))) {
-      recvIndex = (sendIndex + mask) % nranks;          // grow range to the right
-    } else {
-      recvIndex = (sendIndex - mask + nranks) % nranks; // grow range to the left
-      myFirst = recvIndex;
+  // Enumerate get_indexes(start, st) in recursion pre-order via an explicit stack.
+  __device__ __host__ void dfsInit(int start, int st, int* pend, int* top, int* node, int* sval) {
+    if (st >= nsteps) { *pend = -1; *top = 0; return; }
+    int e0 = binePi(start, st, nranks);
+    *pend = e0;
+    node[0] = e0; sval[0] = st + 1; *top = 1;
+  }
+
+  __device__ __host__ int dfsNext(int* pend, int* top, int* node, int* sval) {
+    if (*pend >= 0) { int r = *pend; *pend = -1; return r; }
+    while (*top > 0) {
+      int y = node[*top - 1];
+      int s = sval[*top - 1];
+      if (s >= nsteps) { (*top)--; continue; }
+      sval[*top - 1] = s + 1;
+      int c = binePi(y, s, nranks);
+      node[*top] = c; sval[*top] = s + 1; (*top)++;
+      return c;
     }
+    return -1;
+  }
+
+  // Begin round 'st' (partner, block sets) and its SEND phase.
+  __device__ __host__ void startStep(int st) {
+    remote = binePi(rank, st, nranks);
+    roundK = 1 << (nsteps - 1 - st);
+    dfsInit(rank,   st, &rPend, &rTop, rNode, rSval); // recv set
+    dfsInit(remote, st, &sPend, &sTop, sNode, sSval); // send set
     phase = 1; // SEND
-    rangeStart = sendIndex;
     msgBase = 0;
     pos = 0;
-    m = (int)min(postFreq, mask);
+    m = (int)min(postFreq, roundK);
   }
 
 public:
@@ -811,9 +835,7 @@ public:
     nelem = getNelem();
     phase = 0; // INIT
     pos = 0;
-    step = 0;
-    mask = 1;
-    myFirst = rank;
+    step = nsteps - 1;
   }
 
   __device__ __host__ int getParallelFactor() {
@@ -853,19 +875,19 @@ public:
         if (nsteps == 0) {
           if (offset + chunkCount < end) offset += chunkCount; // else: last==2 set above
         } else {
-          step = 0;
-          mask = 1;
-          myFirst = rank;
-          startStep(0);
+          step = nsteps - 1;       // first round: smallest volume, farthest peer
+          startStep(step);
         }
       }
     } else {
       // SEND (phase 1) or RECV (phase 2) message-wave. pos 0..m-1 are real slices
       // packed at byte offset pos*nelem of one FIFO slot; only pos==m-1 posts.
       int send = (phase == 1);
-      int isFinalWave = (!send && step == nsteps - 1 && offset + chunkCount >= end && msgBase + postFreq >= mask);
+      // Final op of the whole operation: RECV wave of the last message of the last
+      // round (step 0, nearest peer) of the last chunk.
+      int isFinalWave = (!send && step == 0 && offset + chunkCount >= end && msgBase + postFreq >= roundK);
       if (pos < m) {
-        int b = (rangeStart + msgBase + pos) % nranks;
+        int b = send ? dfsNext(&sPend, &sTop, sNode, sSval) : dfsNext(&rPend, &rTop, rNode, rSval);
         ps->nelem = nelem;
         if (send) {
           ps->sendDim = step;
@@ -886,16 +908,14 @@ public:
       if (pos >= postFreq) {           // wave complete
         pos = 0;
         msgBase += postFreq;
-        if (msgBase < mask) {          // more messages in this phase
-          m = (int)min(postFreq, mask - msgBase);
-        } else if (send) {             // SEND phase done -> RECV phase
+        if (msgBase < roundK) {        // more messages in this phase
+          m = (int)min(postFreq, roundK - msgBase);
+        } else if (send) {             // SEND phase done -> RECV phase (recv-set already DFS-inited)
           phase = 2;
-          rangeStart = recvIndex;
           msgBase = 0;
-          m = (int)min(postFreq, mask);
-        } else if (step < nsteps - 1) { // RECV done -> next step
-          step++;
-          mask <<= 1;
+          m = (int)min(postFreq, roundK);
+        } else if (step > 0) {         // RECV done -> next round (closer peer, double volume)
+          step--;
           startStep(step);
         } else if (offset + chunkCount < end) { // -> next chunk
           offset += chunkCount;
