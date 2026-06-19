@@ -726,32 +726,31 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
-// Bine AllGather (libpico allgather_bine_block_by_block) with correct LOCALITY:
-// rounds go step = nsteps-1 .. 0, so the FIRST round exchanges the SMALLEST volume
-// (1 block) with the FARTHEST peer and the LAST round exchanges the LARGEST volume
-// (n/2 blocks) with the NEAREST peer (binePi(rank,0) = rank +/- 1). This is Bine's
-// design intent: keep the heavy transfers on short/fast links. (The earlier
-// "2_blocks" ordering had this BACKWARDS -- largest volume to the farthest peer.)
-// Per round 'step', partner = binePi(rank,step); the rank RECEIVES the block set
-// get_indexes(rank,step) and SENDS get_indexes(remote,step); both sets have
-// 2^(nsteps-1-step) (scattered) blocks, enumerated by an explicit-stack DFS so both
-// endpoints of a connection produce the identical order (FIFO-consistent).
+// Bine RELAY-TREE AllGather (negabinary edges + PAT-style multi-peer width).
+// Each rank's block is broadcast down a tree whose edges are the negabinary
+// neighbours binePi(rank,k). All n source-trees run together, scheduled by TREE
+// DEPTH (not lockstep round): at depth d a rank forwards every block it received by
+// depth d-1 to that block's children (binePi(rank,k)), and receives the depth-d
+// blocks from its parents. Because independent fan-outs (e.g. a rank's own block to
+// all neighbours) collapse into the same depth, a rank talks to up to nsteps
+// DIFFERENT peers per depth -> the multi-peer width PAT has and the pairwise
+// butterfly (block_by_block) lacks. The send sets are identical to block_by_block
+// (per dim k: get_indexes(binePi(rank,k),k)); only the ordering differs (depth, not
+// round). parallelFactor=1: concurrency is cross-peer via the network/FIFO (like
+// PAT), not worker groups. sendDim/recvDim = step index k -> the connection peer
+// binePi(rank,k) that generic.cc already establishes (no connection changes).
 //
-// Concurrency model (PAT-style aggregation + SUB-CHUNKING, the race-free way to get
-// full concurrency out of a pairwise butterfly): each block-slice (nelem elements)
-// is split into K SUB-SLICES of sliceElems elements. A "message" packs up to
-// postFreq sub-slices into ONE FIFO slot at byte offsets 0,sliceElems,2*sliceElems,
-// ... with a SINGLE post. parallelFactor == postFreq, so the postFreq sub-copies run
-// concurrently across worker groups while exactly one advances peer->step (no race).
-// sliceElems is chosen so postFreq reaches maxParallelFactor even when chunkCount is
-// large (where plain block packing would give postFreq=1): at large messages a block
-// is sub-chunked (K>1) to refill in-flight depth; at small messages sliceElems ==
-// chunkCount (K=1). This adds NO extra barriers vs the K=1 case -- the message-wave
-// COUNT is unchanged, each wave just carries postFreq concurrent sub-copies instead
-// of 1. The op stream is waves of exactly postFreq ops; each wave is single-direction
-// (all sends / all recvs / the INIT) so it never deadlocks and has no output hazard.
+// The per-rank op list (kind/dim/src/pack/post) depends only on rank/nranks/packLimit
+// -- all identical on host(proxy, T=char) and device(kernel, T) (chunkCount_char =
+// chunkCount_T*sizeof(T), packLimit matches by the floor identity), so both endpoints
+// agree on structure; byte offsets scale by sizeof(T) consistently. The list is built
+// once at construction and replayed per chunk. Sized for the multi-node benchmark
+// (po2 nRanks <= 256; tuning.cc restricts use). NOTE: construction does an O(n^2)-ish
+// tree walk on the single compute thread -> a fixed per-call latency, negligible for
+// the large messages this targets.
 template <typename T>
 class PatAGAlgorithm {
+  static const int RMAXOPS = 520; // >= 2*nRanks-1 for nRanks <= 256
   size_t offset; // current chunk start within [0, count); advances by chunkCount
   size_t end;    // channelOffset + channelCount
   size_t count;  // elements per source rank (block stride in the output buffer)
@@ -760,217 +759,110 @@ class PatAGAlgorithm {
   int rank;
   int nranks;
   int nsteps;        // log2(nranks)
-  int postFreq;      // sub-slices packed per message == parallelFactor (#worker groups)
-  int sliceElems;    // elements per sub-slice (packing/concurrency unit, <= chunkCount)
-  int K;             // sub-slices per block-slice this chunk = ceil(nelem/sliceElems)
+  int packLimit;     // max sources packed per FIFO slot (= slotElems/chunkCount)
 
-  // Schedule cursor. Layout per chunk: INIT wave (own-block copy + postFreq-1 skip
-  // pads); then step = nsteps-1 .. 0, partner binePi(rank,step): a SEND phase of the
-  // send-set get_indexes(remote,step) then a RECV phase of the recv-set
-  // get_indexes(rank,step). Each phase has roundK blocks * K sub-slices = totalSlices
-  // sub-slices, emitted as ceil(totalSlices/postFreq) message-waves (last padded).
-  int phase;         // 0 = INIT, 1 = SEND, 2 = RECV
-  int step;          // current round, nsteps-1 .. 0  (distant -> near as it counts down)
-  int remote;        // partner = binePi(rank, step)
-  int roundK;        // blocks exchanged each direction this round = 2^(nsteps-1-step)
-  int totalSlices;   // sub-slices this phase = roundK * K
-  int sliceIdx;      // real sub-slices emitted so far in this phase, 0 .. totalSlices
-  int sliceBase;     // sliceIdx at the start of the current wave
-  int curBlock;      // current DFS block (its K sub-slices are emitted consecutively)
-  int pos;           // position within the current wave, 0 .. postFreq-1
-  int m;             // real sub-slices in the current message = min(postFreq, totalSlices-sliceBase)
+  // Precomputed depth-ordered op list (structure only; offsets computed at emit).
+  short opSrc[RMAXOPS];          // source block (data rank)
+  short opPack[RMAXOPS];         // position within its FIFO slot (0..packLimit-1)
+  unsigned char opKind[RMAXOPS]; // 0 = INIT (own block), 1 = SEND, 2 = RECV
+  unsigned char opDim[RMAXOPS];  // step index k -> peer binePi(rank,k)
+  unsigned char opPost[RMAXOPS]; // 1 if this op posts (last slice of its message)
+  int nOps;
+  int ip;                        // current op index within the chunk
 
-  // DFS iterator over get_indexes(rank,step)   -> blocks we RECEIVE.
-  int rPend, rTop, rNode[32], rSval[32];
-  // DFS iterator over get_indexes(remote,step) -> blocks we SEND.
-  int sPend, sTop, sNode[32], sSval[32];
+  __device__ __host__ ssize_t imin(ssize_t a, ssize_t b) { return (a < b) ? a : b; }
+  __device__ __host__ int getNelem() { return (int)imin(chunkCount, end - offset); }
 
-  __device__ __host__ ssize_t min(ssize_t a, ssize_t b) {
-    return (a < b) ? a : b;
-  }
-
-  __device__ __host__ int getNelem() {
-    return min(chunkCount, end - offset);
-  }
-
-  // Sub-slices needed to cover 'ne' elements at sliceElems granularity.
-  __device__ __host__ int subCount(int ne) {
-    return (ne + sliceElems - 1) / sliceElems;
-  }
-
-  // Enumerate get_indexes(start, st) in recursion pre-order via an explicit stack.
-  __device__ __host__ void dfsInit(int start, int st, int* pend, int* top, int* node, int* sval) {
-    if (st >= nsteps) { *pend = -1; *top = 0; return; }
-    int e0 = binePi(start, st, nranks);
-    *pend = e0;
-    node[0] = e0; sval[0] = st + 1; *top = 1;
-  }
-
-  __device__ __host__ int dfsNext(int* pend, int* top, int* node, int* sval) {
-    if (*pend >= 0) { int r = *pend; *pend = -1; return r; }
-    while (*top > 0) {
-      int y = node[*top - 1];
-      int s = sval[*top - 1];
-      if (s >= nsteps) { (*top)--; continue; }
-      sval[*top - 1] = s + 1;
+  // Enumerate get_indexes(start,st) in DFS pre-order into out[]; returns count.
+  __device__ __host__ int getIdx(int start, int st, int* out) {
+    if (st >= nsteps) return 0;
+    int e0 = binePi(start, st, nranks); int no = 0; out[no++] = e0;
+    int node[32], sval[32], top = 0; node[0] = e0; sval[0] = st + 1; top = 1;
+    while (top > 0) {
+      int y = node[top - 1], s = sval[top - 1];
+      if (s >= nsteps) { top--; continue; }
+      sval[top - 1] = s + 1;
       int c = binePi(y, s, nranks);
-      node[*top] = c; sval[*top] = s + 1; (*top)++;
-      return c;
+      out[no++] = c; node[top] = c; sval[top] = s + 1; top++;
     }
-    return -1;
+    return no;
   }
-
-  // Begin round 'st' (partner, block sets) and its SEND phase.
-  __device__ __host__ void startStep(int st) {
-    remote = binePi(rank, st, nranks);
-    roundK = 1 << (nsteps - 1 - st);
-    dfsInit(rank,   st, &rPend, &rTop, rNode, rSval); // recv set
-    dfsInit(remote, st, &sPend, &sTop, sNode, sSval); // send set
-    phase = 1; // SEND
-    totalSlices = roundK * K;
-    sliceIdx = 0;
-    sliceBase = 0;
-    curBlock = -1;
-    pos = 0;
-    m = (int)min(postFreq, totalSlices);
+  __device__ __host__ bool inArr(int s, int* a, int c) { for (int i = 0; i < c; i++) if (a[i] == s) return true; return false; }
+  // Depth of 'rank' in source s's broadcast tree (hops s -> rank).
+  __device__ __host__ int depthOf(int s) {
+    if (s == rank) return 0;
+    int x = rank, d = 0, guard = 0, tmp[260];
+    while (x != s && guard++ < 2 * nranks) {
+      int f = -1;
+      for (int k = 0; k < nsteps; k++) { int c = getIdx(x, k, tmp); if (inArr(s, tmp, c)) { f = k; break; } }
+      if (f < 0) return -1;
+      x = binePi(x, f, nranks); d++;
+    }
+    return d;
   }
 
 public:
   __device__ __host__ PatAGAlgorithm(int slotBytes, int stepDepth, int maxParallelFactor, size_t offset, size_t end,
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
+    (void)stepDepth; (void)maxParallelFactor;
     nsteps = log2Up(nranks);
-    (void)stepDepth;
-    // Pick sliceElems so postFreq (sub-slices per slot) reaches maxParallelFactor,
-    // keeping sliceElems as LARGE as possible (fewest sub-slices) to minimise op
-    // count. Start at the full block-slice; halve while it still divides evenly and
-    // we have not yet reached the worker-group budget.
-    //
-    // Host(proxy, T=char, byte units)/device(kernel, T, element units) consistency:
-    // slotBytes is identical; chunkCount is in each side's units with
-    // chunkCount_char = chunkCount_T * sizeof(T). postFreq matches at every halving
-    // step by floor(floor(slotBytes/sizeof(T))/s) == floor(slotBytes/(sizeof(T)*s)),
-    // so both sides take the same number of halvings -> sliceElems_char ==
-    // sliceElems_T * sizeof(T), making all slot/block byte offsets agree. chunkCount
-    // is always a multiple of 512/sizeof(T) >= 64 (ncclCollCbdPart grain), and
-    // K = chunkCount/sliceElems <= maxParallelFactor <= 16, so K always divides
-    // chunkCount evenly and postFreq is reached before the even-check can bite.
-    int slotElems = slotBytes / (int)sizeof(T);
-    if (slotElems < 1) slotElems = 1;
-    sliceElems = chunkCount > 0 ? chunkCount : 1;
-    postFreq = slotElems / sliceElems;
-    if (postFreq < 1) postFreq = 1;
-    while (postFreq < maxParallelFactor && (sliceElems & 1) == 0 && sliceElems >= 2) {
-      sliceElems /= 2;
-      postFreq = slotElems / sliceElems;
-    }
-    if (postFreq > maxParallelFactor) postFreq = maxParallelFactor;
-    if (postFreq < 1) postFreq = 1;
-    if (sliceElems < 1) sliceElems = 1;
+    int slotElems = slotBytes / (int)sizeof(T); if (slotElems < 1) slotElems = 1;
+    packLimit = chunkCount > 0 ? slotElems / chunkCount : 1; if (packLimit < 1) packLimit = 1;
     nelem = getNelem();
-    K = subCount(nelem);
-    phase = 0; // INIT
-    pos = 0;
-    step = nsteps - 1;
+    // Build the depth-ordered relay op list.
+    int dof[260]; for (int s = 0; s < nranks; s++) dof[s] = depthOf(s);
+    int maxDepth = 0; for (int s = 0; s < nranks; s++) if (dof[s] > maxDepth) maxDepth = dof[s];
+    nOps = 0;
+    opKind[nOps] = 0; opDim[nOps] = 0; opSrc[nOps] = (short)rank; opPack[nOps] = 0; opPost[nOps] = 0; nOps++; // INIT own block
+    int set[260];
+    for (int d = 1; d <= maxDepth; d++) {
+      // SENDS at depth d: src with depth d-1 in get_indexes(binePi(rank,k),k) -> peer dim k
+      for (int k = 0; k < nsteps; k++) {
+        int c = getIdx(binePi(rank, k, nranks), k, set), cnt = 0;
+        for (int i = 0; i < c; i++) { int s = set[i]; if (dof[s] != d - 1) continue;
+          if (nOps >= RMAXOPS) break;
+          opKind[nOps] = 1; opDim[nOps] = (unsigned char)k; opSrc[nOps] = (short)s; opPack[nOps] = (short)cnt; opPost[nOps] = 0;
+          cnt++; nOps++;
+          if (cnt == packLimit) { opPost[nOps - 1] = 1; cnt = 0; }
+        }
+        if (cnt > 0) opPost[nOps - 1] = 1;
+      }
+      // RECVS at depth d: src with depth d in get_indexes(rank,j) -> peer dim j
+      for (int j = 0; j < nsteps; j++) {
+        int c = getIdx(rank, j, set), cnt = 0;
+        for (int i = 0; i < c; i++) { int s = set[i]; if (dof[s] != d) continue;
+          if (nOps >= RMAXOPS) break;
+          opKind[nOps] = 2; opDim[nOps] = (unsigned char)j; opSrc[nOps] = (short)s; opPack[nOps] = (short)cnt; opPost[nOps] = 0;
+          cnt++; nOps++;
+          if (cnt == packLimit) { opPost[nOps - 1] = 1; cnt = 0; }
+        }
+        if (cnt > 0) opPost[nOps - 1] = 1;
+      }
+    }
+    ip = 0;
   }
 
-  __device__ __host__ int getParallelFactor() {
-    return postFreq;
-  }
+  __device__ __host__ int getParallelFactor() { return 1; }
 
   __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
-    ps->last = 0;
-    ps->nelem = nelem;
-    ps->recvDim = -1;
-    ps->sendDim = -1;
-    ps->recvOffset = 0;
-    ps->sendOffset = 0;
-    ps->stepOffset = 0;
-    ps->postRecv = 0;
-    ps->postSend = 0;
-    ps->inpIx = 0;
-    ps->outIx = 0;
-    int skip = 0;
-
-    if (phase == 0) {
-      // INIT wave: pos 0 copies our own (whole) block-slice; pos 1..postFreq-1 are
-      // skip pads so the first SEND wave (which reads our output) lands in a later,
-      // barrier-separated wave. The local copy is not sub-chunked.
-      if (pos == 0) {
-        nelem = getNelem();
-        K = subCount(nelem);
-        ps->nelem = nelem;
-        ps->inpIx = offset;
-        ps->outIx = (size_t)rank * count + offset;
-      } else {
-        skip = 1;
-      }
-      if (nsteps == 0 && offset + chunkCount >= end) ps->last = (pos == postFreq - 1) ? 2 : 1;
-      pos++;
-      if (pos >= postFreq) {
-        pos = 0;
-        if (nsteps == 0) {
-          if (offset + chunkCount < end) offset += chunkCount; // else: last==2 set above
-        } else {
-          step = nsteps - 1;       // first round: smallest volume, farthest peer
-          startStep(step);
-        }
-      }
-    } else {
-      // SEND (phase 1) or RECV (phase 2) message-wave. pos 0..m-1 are real sub-slices
-      // packed at byte offset pos*sliceElems of one FIFO slot; only pos==m-1 posts.
-      int send = (phase == 1);
-      // Final op of the whole operation: last wave of the RECV phase of the last
-      // round (step 0, nearest peer) of the last chunk.
-      int isFinalWave = (!send && step == 0 && offset + chunkCount >= end && sliceBase + postFreq >= totalSlices);
-      if (pos < m) {
-        int sub = sliceIdx % K;                   // sub-slice index within the block
-        if (sub == 0) {                           // first sub-slice of a block -> pull next block
-          curBlock = send ? dfsNext(&sPend, &sTop, sNode, sSval) : dfsNext(&rPend, &rTop, rNode, rSval);
-        }
-        int subOff = sub * sliceElems;
-        int subNelem = (int)min(sliceElems, nelem - subOff);
-        ps->nelem = subNelem;
-        if (send) {
-          ps->sendDim = step;
-          ps->inpIx = (size_t)curBlock * count + offset + subOff; // patCopy reads userOutput
-          ps->sendOffset = pos * sliceElems;
-          ps->postSend = (pos == m - 1) ? 1 : 0;
-        } else {
-          ps->recvDim = step;
-          ps->outIx = (size_t)curBlock * count + offset + subOff;
-          ps->recvOffset = pos * sliceElems;
-          ps->postRecv = (pos == m - 1) ? 1 : 0;
-        }
-        sliceIdx++;
-      } else {
-        skip = 1;
-      }
-      if (isFinalWave) ps->last = (pos == postFreq - 1) ? 2 : 1;
-      pos++;
-      if (pos >= postFreq) {           // wave complete
-        pos = 0;
-        sliceBase = sliceIdx;
-        if (sliceIdx < totalSlices) {  // more messages in this phase
-          m = (int)min(postFreq, totalSlices - sliceIdx);
-        } else if (send) {             // SEND phase done -> RECV phase (recv-set already DFS-inited)
-          phase = 2;
-          sliceIdx = 0;
-          sliceBase = 0;
-          curBlock = -1;
-          m = (int)min(postFreq, totalSlices);
-        } else if (step > 0) {         // RECV done -> next round (closer peer, double volume)
-          step--;
-          startStep(step);
-        } else if (offset + chunkCount < end) { // -> next chunk
-          offset += chunkCount;
-          phase = 0;
-        }
-        // else: final wave of the operation; last==2 was set above.
-      }
+    ps->last = 0; ps->recvDim = -1; ps->sendDim = -1; ps->recvOffset = 0; ps->sendOffset = 0;
+    ps->stepOffset = 0; ps->postRecv = 0; ps->postSend = 0; ps->inpIx = 0; ps->outIx = 0;
+    nelem = getNelem(); ps->nelem = nelem;
+    int K = opKind[ip], k = opDim[ip], s = opSrc[ip], pk = opPack[ip], po = opPost[ip];
+    if (K == 0) {                       // INIT: copy own block input -> output[rank]
+      ps->inpIx = offset; ps->outIx = (size_t)rank * count + offset;
+    } else if (K == 1) {                // SEND src s to peer dim k (forward-send reads output[src])
+      ps->sendDim = k; ps->inpIx = (size_t)s * count + offset; ps->sendOffset = pk * nelem; ps->postSend = po;
+    } else {                            // RECV src s from peer dim k -> output[src]
+      ps->recvDim = k; ps->outIx = (size_t)s * count + offset; ps->recvOffset = pk * nelem; ps->postRecv = po;
     }
-
-    int flags = PatUsed | (skip ? PatSkipped : 0);
+    ip++;
+    if (ip >= nOps) {
+      if (offset + chunkCount >= end) ps->last = 2;   // final op of the whole operation
+      else { offset += chunkCount; ip = 0; }          // next chunk: replay op list
+    }
+    int flags = PatUsed;
 #if __CUDA_ARCH__ >= 600
     cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
     a.store(flags, cuda::memory_order_release);

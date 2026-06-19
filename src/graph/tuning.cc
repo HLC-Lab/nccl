@@ -302,9 +302,11 @@ ncclResult_t ncclTopoTuneModel(struct ncclComm* comm, int minCompCap, int maxCom
         if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather) && a == NCCL_ALGO_PAT &&
             (p != NCCL_PROTO_SIMPLE || ncclPatEnable(comm) == 0))
           continue;
-        // The AllGather PAT path now uses the Bine (pairwise) schedule, which is
-        // only defined for a power-of-two number of ranks; fall back to Ring otherwise.
-        if (coll == ncclFuncAllGather && a == NCCL_ALGO_PAT && (nRanks & (nRanks - 1)) != 0) continue;
+        // The AllGather PAT path now uses the Bine relay-tree schedule: defined only
+        // for a power-of-two rank count, and its precomputed op list is sized for
+        // nRanks <= 256 (PatAGAlgorithm::RMAXOPS). Fall back to Ring otherwise.
+        if (coll == ncclFuncAllGather && a == NCCL_ALGO_PAT &&
+            ((nRanks & (nRanks - 1)) != 0 || nRanks > 256)) continue;
         int collnet = (a == NCCL_ALGO_COLLNET_DIRECT || a == NCCL_ALGO_COLLNET_CHAIN) ? 1 : 0;
         float bw = nNodes <= 2 || collnet ? graphs[a]->bwIntra : graphs[a]->bwInter;
         if (a == NCCL_ALGO_NVLS_TREE || a == NCCL_ALGO_NVLS) {
