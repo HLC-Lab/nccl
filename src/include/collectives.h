@@ -726,31 +726,27 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
-// Bine RELAY-TREE AllGather (negabinary edges + PAT-style multi-peer width).
-// Each rank's block is broadcast down a tree whose edges are the negabinary
-// neighbours binePi(rank,k). All n source-trees run together, scheduled by TREE
-// DEPTH (not lockstep round): at depth d a rank forwards every block it received by
-// depth d-1 to that block's children (binePi(rank,k)), and receives the depth-d
-// blocks from its parents. Because independent fan-outs (e.g. a rank's own block to
-// all neighbours) collapse into the same depth, a rank talks to up to nsteps
-// DIFFERENT peers per depth -> the multi-peer width PAT has and the pairwise
-// butterfly (block_by_block) lacks. The send sets are identical to block_by_block
-// (per dim k: get_indexes(binePi(rank,k),k)); only the ordering differs (depth, not
-// round). parallelFactor=1: concurrency is cross-peer via the network/FIFO (like
-// PAT), not worker groups. sendDim/recvDim = step index k -> the connection peer
-// binePi(rank,k) that generic.cc already establishes (no connection changes).
+// Bine FUSED RELAY-TREE AllGather (negabinary edges, PAT-style multi-peer width + fusion).
+// Each rank's block is broadcast down a tree of negabinary neighbours binePi(rank,k);
+// all n source-trees run together, scheduled by TREE DEPTH so a rank talks to up to
+// nsteps DIFFERENT peers per depth (the multi-peer width PAT has, the pairwise butterfly
+// lacks). Like PAT, a relayed block is RECEIVED AND FORWARDED in ONE fused op
+// (recvDim>=0 && sendDim>=0): patCopy reads the recv-FIFO once and writes BOTH the output
+// buffer and the child's send-FIFO -- halving copy/op cost vs separate recv+send. Op
+// kinds: INIT (own block input->output), FUSED (recv s from parent + forward to its first
+// child), SEND (extra forward of a held block, reads output), RECV (leaf receive). One
+// block per op (no packing; PAT's AG postFreq is 1 too). parallelFactor=1: concurrency is
+// cross-peer via the FIFO, not worker groups. sendDim/recvDim = step index k -> connection
+// peer binePi(rank,k) (generic.cc connects these; send-peer == recv-peer per dim).
 //
-// The per-rank op list (kind/dim/src/pack/post) depends only on rank/nranks/packLimit
-// -- all identical on host(proxy, T=char) and device(kernel, T) (chunkCount_char =
-// chunkCount_T*sizeof(T), packLimit matches by the floor identity), so both endpoints
-// agree on structure; byte offsets scale by sizeof(T) consistently. The list is built
-// once at construction and replayed per chunk. Sized for the multi-node benchmark
-// (po2 nRanks <= 256; tuning.cc restricts use). NOTE: construction does an O(n^2)-ish
-// tree walk on the single compute thread -> a fixed per-call latency, negligible for
-// the large messages this targets.
+// The op list (kind/rdim/sdim/src) depends only on rank/nranks -> identical on
+// host(proxy, T=char) and device(kernel, T); byte offsets scale by sizeof(T). Built once
+// at construction (an O(n^2) tree walk on the single compute thread = fixed per-call
+// latency, negligible for large messages), replayed per chunk. Sized for po2 nRanks <= 256
+// (tuning.cc restricts use).
 template <typename T>
 class PatAGAlgorithm {
-  static const int RMAXOPS = 520; // >= 2*nRanks-1 for nRanks <= 256
+  static const int RMAXOPS = 520; // >= ~1.5*nRanks for nRanks <= 256
   size_t offset; // current chunk start within [0, count); advances by chunkCount
   size_t end;    // channelOffset + channelCount
   size_t count;  // elements per source rank (block stride in the output buffer)
@@ -759,14 +755,12 @@ class PatAGAlgorithm {
   int rank;
   int nranks;
   int nsteps;        // log2(nranks)
-  int packLimit;     // max sources packed per FIFO slot (= slotElems/chunkCount)
 
-  // Precomputed depth-ordered op list (structure only; offsets computed at emit).
+  // Precomputed op list (structure only; offsets computed at emit time).
   short opSrc[RMAXOPS];          // source block (data rank)
-  short opPack[RMAXOPS];         // position within its FIFO slot (0..packLimit-1)
-  unsigned char opKind[RMAXOPS]; // 0 = INIT (own block), 1 = SEND, 2 = RECV
-  unsigned char opDim[RMAXOPS];  // step index k -> peer binePi(rank,k)
-  unsigned char opPost[RMAXOPS]; // 1 if this op posts (last slice of its message)
+  signed char opRdim[RMAXOPS];   // recv dim (-1 if none) -> recv from binePi(rank,opRdim)
+  signed char opSdim[RMAXOPS];   // send dim (-1 if none) -> send to  binePi(rank,opSdim)
+  unsigned char opKind[RMAXOPS]; // 0 INIT, 1 SEND-only, 2 RECV-only, 3 FUSED (recv+send)
   int nOps;
   int ip;                        // current op index within the chunk
 
@@ -800,44 +794,46 @@ class PatAGAlgorithm {
     }
     return d;
   }
+  __device__ __host__ void push(int kind, int rd, int sd, int s) {
+    if (nOps >= RMAXOPS) return;
+    opKind[nOps] = (unsigned char)kind; opRdim[nOps] = (signed char)rd; opSdim[nOps] = (signed char)sd;
+    opSrc[nOps] = (short)s; nOps++;
+  }
 
 public:
   __device__ __host__ PatAGAlgorithm(int slotBytes, int stepDepth, int maxParallelFactor, size_t offset, size_t end,
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
-    (void)stepDepth; (void)maxParallelFactor;
+    (void)slotBytes; (void)stepDepth; (void)maxParallelFactor;
     nsteps = log2Up(nranks);
-    int slotElems = slotBytes / (int)sizeof(T); if (slotElems < 1) slotElems = 1;
-    packLimit = chunkCount > 0 ? slotElems / chunkCount : 1; if (packLimit < 1) packLimit = 1;
     nelem = getNelem();
-    // Build the depth-ordered relay op list.
-    int dof[260]; for (int s = 0; s < nranks; s++) dof[s] = depthOf(s);
+    // Precompute: recv dim per source (krecv), child send-dims bitmask (cmask), tree depth.
+    signed char krecv[260]; unsigned char cmask[260]; int dof[260];
+    for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; }
+    int set[260];
+    for (int k = 0; k < nsteps; k++) {
+      int c = getIdx(rank, k, set);                for (int i = 0; i < c; i++) krecv[set[i]] = (signed char)k; // r receives set[i] via dim k
+      c = getIdx(binePi(rank, k, nranks), k, set); for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);     // r forwards set[i] to child dim k
+    }
+    for (int s = 0; s < nranks; s++) dof[s] = depthOf(s);
     int maxDepth = 0; for (int s = 0; s < nranks; s++) if (dof[s] > maxDepth) maxDepth = dof[s];
     nOps = 0;
-    opKind[nOps] = 0; opDim[nOps] = 0; opSrc[nOps] = (short)rank; opPack[nOps] = 0; opPost[nOps] = 0; nOps++; // INIT own block
-    int set[260];
-    for (int d = 1; d <= maxDepth; d++) {
-      // SENDS at depth d: src with depth d-1 in get_indexes(binePi(rank,k),k) -> peer dim k
-      for (int k = 0; k < nsteps; k++) {
-        int c = getIdx(binePi(rank, k, nranks), k, set), cnt = 0;
-        for (int i = 0; i < c; i++) { int s = set[i]; if (dof[s] != d - 1) continue;
-          if (nOps >= RMAXOPS) break;
-          opKind[nOps] = 1; opDim[nOps] = (unsigned char)k; opSrc[nOps] = (short)s; opPack[nOps] = (short)cnt; opPost[nOps] = 0;
-          cnt++; nOps++;
-          if (cnt == packLimit) { opPost[nOps - 1] = 1; cnt = 0; }
+    push(0, -1, -1, rank); // INIT own block input -> output
+    for (int d = 0; d <= maxDepth; d++) {
+      for (int s = 0; s < nranks; s++) {
+        if (dof[s] != d) continue;
+        if (s == rank) {                       // own block (d==0): forward to every child
+          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s);
+        } else {
+          int first = -1;
+          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) { first = k; break; }
+          if (first >= 0) {
+            push(3, krecv[s], first, s);         // FUSED: recv s from parent + forward to first child
+            for (int k = first + 1; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards (read output)
+          } else {
+            push(2, krecv[s], -1, s);            // leaf: receive only
+          }
         }
-        if (cnt > 0) opPost[nOps - 1] = 1;
-      }
-      // RECVS at depth d: src with depth d in get_indexes(rank,j) -> peer dim j
-      for (int j = 0; j < nsteps; j++) {
-        int c = getIdx(rank, j, set), cnt = 0;
-        for (int i = 0; i < c; i++) { int s = set[i]; if (dof[s] != d) continue;
-          if (nOps >= RMAXOPS) break;
-          opKind[nOps] = 2; opDim[nOps] = (unsigned char)j; opSrc[nOps] = (short)s; opPack[nOps] = (short)cnt; opPost[nOps] = 0;
-          cnt++; nOps++;
-          if (cnt == packLimit) { opPost[nOps - 1] = 1; cnt = 0; }
-        }
-        if (cnt > 0) opPost[nOps - 1] = 1;
       }
     }
     ip = 0;
@@ -849,17 +845,17 @@ public:
     ps->last = 0; ps->recvDim = -1; ps->sendDim = -1; ps->recvOffset = 0; ps->sendOffset = 0;
     ps->stepOffset = 0; ps->postRecv = 0; ps->postSend = 0; ps->inpIx = 0; ps->outIx = 0;
     nelem = getNelem(); ps->nelem = nelem;
-    int K = opKind[ip], k = opDim[ip], s = opSrc[ip], pk = opPack[ip], po = opPost[ip];
-    if (K == 0) {                       // INIT: copy own block input -> output[rank]
+    int K = opKind[ip], rd = opRdim[ip], sd = opSdim[ip], s = opSrc[ip];
+    if (K == 0) {                                              // INIT: own block input -> output[rank]
       ps->inpIx = offset; ps->outIx = (size_t)rank * count + offset;
-    } else if (K == 1) {                // SEND src s to peer dim k (forward-send reads output[src])
-      ps->sendDim = k; ps->inpIx = (size_t)s * count + offset; ps->sendOffset = pk * nelem; ps->postSend = po;
-    } else {                            // RECV src s from peer dim k -> output[src]
-      ps->recvDim = k; ps->outIx = (size_t)s * count + offset; ps->recvOffset = pk * nelem; ps->postRecv = po;
+    } else {
+      // FUSED sets both; SEND-only sets send; RECV-only sets recv. One block per op (no packing).
+      if (rd >= 0) { ps->recvDim = rd; ps->outIx = (size_t)s * count + offset; ps->postRecv = 1; }
+      if (sd >= 0) { ps->sendDim = sd; ps->inpIx = (size_t)s * count + offset; ps->postSend = 1; }
     }
     ip++;
     if (ip >= nOps) {
-      if (offset + chunkCount >= end) ps->last = 2;   // final op of the whole operation
+      if (offset + chunkCount >= end) ps->last = 2;   // final op of the operation
       else { offset += chunkCount; ip = 0; }          // next chunk: replay op list
     }
     int flags = PatUsed;
