@@ -730,8 +730,16 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // permutation. Each rank holds a contiguous (mod-wraparound) range of source
 // blocks and DOUBLES it each step by exchanging 'mask' blocks with partner
 // binePi(rank,step). mask = 1,2,4,...; the held range grows right or left
-// depending on (step parity == rank parity). vs block_by_block this sends
-// CONTIGUOUS source ranges instead of scattered sets.
+// depending on (step parity == rank parity).
+//
+// Concurrency model (PAT-style aggregation, the only safe form for a pairwise
+// butterfly): a "message" packs up to postFreq block-slices into ONE FIFO slot at
+// byte offsets 0,nelem,2*nelem,... with a SINGLE post. parallelFactor == postFreq,
+// so the postFreq copies of a message run concurrently across worker groups while
+// exactly one of them advances peer->step (no peer->step race). The op stream is a
+// sequence of "waves" of exactly postFreq ops; each wave is single-direction (all
+// sends, or all recvs, or the INIT) so it never deadlocks and never has an
+// intra-wave output hazard. nelem == chunkCount (<= slot), never a large flat copy.
 template <typename T>
 class PatAGAlgorithm {
   size_t offset; // current chunk start within [0, count); advances by chunkCount
@@ -742,30 +750,23 @@ class PatAGAlgorithm {
   int rank;
   int nranks;
   int nsteps;        // log2(nranks)
-  int slotElems;     // FIFO slot capacity in elements
-  int flat;          // 1 when chunkCount==count: consecutive blocks are contiguous in
-                     // memory -> one coalesced copy per slot (the win); else per-block.
+  int postFreq;      // block-slices packed per message == parallelFactor (#worker groups)
 
-  // parallelFactor is 1 (single 512-thread group, sequential ops). Layout per
-  // chunk: INIT (own-block copy); then step=0..nsteps-1 (mask doubling), partner
-  // binePi(rank,step): a SEND of the contiguous held range [sendIndex,+mask) then
-  // a RECV of [recvIndex,+mask). Send-before-recv keeps the pairwise exchange
-  // deadlock free. A "message" (one post) is one slot-sized contiguous run-piece
-  // (flat) or one block (strided).
+  // Schedule cursor. Layout per chunk: INIT wave (own-block copy + postFreq-1 skip
+  // pads); then step=0..nsteps-1 (mask doubling), partner binePi(rank,step): a SEND
+  // phase of the contiguous range [sendIndex,+mask) then a RECV phase of
+  // [recvIndex,+mask). Each phase is emitted as ceil(mask/postFreq) message-waves;
+  // the last wave is skip-padded up to postFreq.
   int phase;         // 0 = INIT, 1 = SEND, 2 = RECV
   int step;          // current step, 0 .. nsteps-1
   int mask;          // blocks exchanged this step (1,2,4,...)
   int myFirst;       // start block of our contiguous held range
   int sendIndex;     // start block of the range we send this step
   int recvIndex;     // start block of the range we receive this step
-
-  // Emission cursor over the current phase's block range [rangeStart, +mask).
-  int rangeStart;
-  int blkIdx;        // strided: block within range, 0 .. mask-1
-  int runStart;        // flat: first block of the current contiguous (pre-wrap) run
-  int runBlocks;       // flat: blocks in the current run
-  size_t runElemDone;  // flat: elements emitted from the current run
-  int blocksLeft;      // flat: blocks of the range not yet started
+  int rangeStart;    // start block of the phase's range (sendIndex or recvIndex)
+  int msgBase;       // block index within [0,mask) at the start of the current wave
+  int pos;           // position within the current wave, 0 .. postFreq-1
+  int m;             // real block-slices in the current message = min(postFreq, mask-msgBase)
 
   __device__ __host__ ssize_t min(ssize_t a, ssize_t b) {
     return (a < b) ? a : b;
@@ -775,27 +776,20 @@ class PatAGAlgorithm {
     return min(chunkCount, end - offset);
   }
 
-  // Begin emitting the block range [rstart, rstart+mask) (mod nranks).
-  __device__ __host__ void beginRange(int rstart) {
-    rangeStart = rstart;
-    blkIdx = 0;
-    blocksLeft = mask;
-    runStart = rstart;
-    runBlocks = (int)min(blocksLeft, nranks - runStart); // contiguous until wraparound
-    runElemDone = 0;
-  }
-
-  // Compute send/recv block ranges for 'st' and begin the SEND range.
+  // Compute send/recv ranges for step 'st' and begin its SEND phase.
   __device__ __host__ void startStep(int st) {
     sendIndex = myFirst;
     if (((st & 1) == (rank & 1))) {
-      recvIndex = (sendIndex + mask) % nranks;       // grow range to the right
+      recvIndex = (sendIndex + mask) % nranks;          // grow range to the right
     } else {
       recvIndex = (sendIndex - mask + nranks) % nranks; // grow range to the left
       myFirst = recvIndex;
     }
     phase = 1; // SEND
-    beginRange(sendIndex);
+    rangeStart = sendIndex;
+    msgBase = 0;
+    pos = 0;
+    m = (int)min(postFreq, mask);
   }
 
 public:
@@ -803,19 +797,27 @@ public:
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
     nsteps = log2Up(nranks);
-    (void)stepDepth; (void)maxParallelFactor;
-    slotElems = slotBytes / (int)sizeof(T);
-    if (slotElems < 1) slotElems = 1;
-    flat = ((size_t)chunkCount == count) ? 1 : 0; // whole-block chunks -> contiguous runs
+    (void)stepDepth;
+    // postFreq = how many nelem-slices fit one FIFO slot, capped by the worker-group
+    // budget (maxParallelFactor). Power of two so it cleanly divides the worker pool.
+    // slotBytes and chunkCount are identical on host (proxy) and device (kernel) so
+    // postFreq matches. Small/mid messages -> small chunk -> large postFreq (high
+    // concurrency, where the PAT gap is worst); large messages -> postFreq -> 1.
+    int chunkBytes = chunkCount * (int)sizeof(T);
+    int fit = chunkBytes > 0 ? slotBytes / chunkBytes : 1;
+    if (fit < 1) fit = 1;
+    postFreq = 1;
+    while (postFreq * 2 <= fit && postFreq * 2 <= maxParallelFactor) postFreq *= 2;
     nelem = getNelem();
     phase = 0; // INIT
-    step = nsteps - 1;
+    pos = 0;
+    step = 0;
     mask = 1;
     myFirst = rank;
   }
 
   __device__ __host__ int getParallelFactor() {
-    return 1;
+    return postFreq;
   }
 
   __device__ __host__ void getNextOp(struct ncclPatStep* ps) {
@@ -830,88 +832,80 @@ public:
     ps->postSend = 0;
     ps->inpIx = 0;
     ps->outIx = 0;
+    int skip = 0;
 
     if (phase == 0) {
-      // INIT: copy this rank's own block to its natural output slot.
-      nelem = getNelem();
-      ps->nelem = nelem;
-      ps->inpIx = offset;
-      ps->outIx = (size_t)rank * count + offset;
-      if (nsteps == 0) {
-        if (offset + chunkCount >= end) ps->last = 2;  // single rank, last chunk
-        else offset += chunkCount;
+      // INIT wave: pos 0 copies our own block; pos 1..postFreq-1 are skip pads so
+      // the first SEND wave (which reads our output) lands in a later, barrier-
+      // separated wave.
+      if (pos == 0) {
+        nelem = getNelem();
+        ps->nelem = nelem;
+        ps->inpIx = offset;
+        ps->outIx = (size_t)rank * count + offset;
       } else {
-        step = 0;
-        mask = 1;
-        myFirst = rank;
-        startStep(0);
+        skip = 1;
       }
-      int flags = PatUsed;
-#if __CUDA_ARCH__ >= 600
-      cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
-      a.store(flags, cuda::memory_order_release);
-#else
-      ps->flags = flags;
-#endif
-      return;
-    }
-
-    int send = (phase == 1);
-    ps->sendDim = send ? step : -1;
-    ps->recvDim = send ? -1 : step;
-
-    int phaseDone = 0;
-    if (flat) {
-      // One coalesced contiguous copy per slot, spanning whole blocks.
-      int pieceElems = (int)min(slotElems, runBlocks * (size_t)count - runElemDone);
-      size_t ix = (size_t)runStart * count + offset + runElemDone;
-      ps->nelem = pieceElems;
-      if (send) ps->inpIx = ix; else ps->outIx = ix;  // patCopy: send reads output, recv writes output
-      ps->postSend = send ? 1 : 0;
-      ps->postRecv = send ? 0 : 1;
-      runElemDone += pieceElems;
-      if (runElemDone >= runBlocks * (size_t)count) {     // run complete
-        blocksLeft -= runBlocks;
-        if (blocksLeft > 0) {
-          runStart = (runStart + runBlocks) % nranks;
-          runBlocks = (int)min(blocksLeft, nranks - runStart);
-          runElemDone = 0;
+      if (nsteps == 0 && offset + chunkCount >= end) ps->last = (pos == postFreq - 1) ? 2 : 1;
+      pos++;
+      if (pos >= postFreq) {
+        pos = 0;
+        if (nsteps == 0) {
+          if (offset + chunkCount < end) offset += chunkCount; // else: last==2 set above
         } else {
-          phaseDone = 1;
+          step = 0;
+          mask = 1;
+          myFirst = rank;
+          startStep(0);
         }
       }
     } else {
-      // Strided: one op per block (chunkCount elements at block*count+offset).
-      int b = (rangeStart + blkIdx) % nranks;
-      ps->nelem = nelem;
-      if (send) ps->inpIx = (size_t)b * count + offset; else ps->outIx = (size_t)b * count + offset;
-      ps->postSend = send ? 1 : 0;
-      ps->postRecv = send ? 0 : 1;
-      blkIdx++;
-      if (blkIdx >= mask) phaseDone = 1;
-    }
-
-    if (phaseDone) {
-      if (send) {
-        phase = 2;           // SEND range done -> RECV range
-        beginRange(recvIndex);
+      // SEND (phase 1) or RECV (phase 2) message-wave. pos 0..m-1 are real slices
+      // packed at byte offset pos*nelem of one FIFO slot; only pos==m-1 posts.
+      int send = (phase == 1);
+      int isFinalWave = (!send && step == nsteps - 1 && offset + chunkCount >= end && msgBase + postFreq >= mask);
+      if (pos < m) {
+        int b = (rangeStart + msgBase + pos) % nranks;
+        ps->nelem = nelem;
+        if (send) {
+          ps->sendDim = step;
+          ps->inpIx = (size_t)b * count + offset; // patCopy reads userOutput (forward-send)
+          ps->sendOffset = pos * nelem;
+          ps->postSend = (pos == m - 1) ? 1 : 0;
+        } else {
+          ps->recvDim = step;
+          ps->outIx = (size_t)b * count + offset;
+          ps->recvOffset = pos * nelem;
+          ps->postRecv = (pos == m - 1) ? 1 : 0;
+        }
       } else {
-        // RECV range done -> next step, or next chunk, or finished. Decide the
-        // terminal case from the current (pre-advance) step/offset.
-        if (step < nsteps - 1) {
+        skip = 1;
+      }
+      if (isFinalWave) ps->last = (pos == postFreq - 1) ? 2 : 1;
+      pos++;
+      if (pos >= postFreq) {           // wave complete
+        pos = 0;
+        msgBase += postFreq;
+        if (msgBase < mask) {          // more messages in this phase
+          m = (int)min(postFreq, mask - msgBase);
+        } else if (send) {             // SEND phase done -> RECV phase
+          phase = 2;
+          rangeStart = recvIndex;
+          msgBase = 0;
+          m = (int)min(postFreq, mask);
+        } else if (step < nsteps - 1) { // RECV done -> next step
           step++;
           mask <<= 1;
           startStep(step);
-        } else if (offset + chunkCount < end) {
+        } else if (offset + chunkCount < end) { // -> next chunk
           offset += chunkCount;
-          phase = 0;         // next chunk starts with an INIT op
-        } else {
-          ps->last = 2;      // final op of the whole operation
+          phase = 0;
         }
+        // else: final wave of the operation; last==2 was set above.
       }
     }
 
-    int flags = PatUsed;
+    int flags = PatUsed | (skip ? PatSkipped : 0);
 #if __CUDA_ARCH__ >= 600
     cuda::atomic_ref<int, cuda::thread_scope_block> a(ps->flags);
     a.store(flags, cuda::memory_order_release);
