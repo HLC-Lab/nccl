@@ -50,41 +50,23 @@ for r in $(seq 1 "$REPS"); do
 done
 
 echo ""
-echo "=== SUMMARY: out-of-place busbw (GB/s), mean over $REPS reps ==="
-python3 - "$OUT" <<'PY' | tee "$OUT/summary.txt"
-import sys, glob, os
-from collections import defaultdict
-d = sys.argv[1]
-data = defaultdict(lambda: defaultdict(list))   # algo -> size -> [busbw_oop]
-for f in glob.glob(os.path.join(d, "*_rep*.log")):
-    algo = os.path.basename(f).split("_rep")[0]
-    for line in open(f):
-        p = line.split()
-        if len(p) >= 9 and p[2] == "float":
-            try:
-                sz = int(p[0]); bw = float(p[7])
-            except ValueError:
-                continue
-            if sz > 0:
-                data[algo][sz].append(bw)
-def avg(l): return sum(l)/len(l) if l else 0.0
-sizes = sorted({s for a in data for s in data[a]})
-print(f"{'size(B)':>13} {'Ring':>7} {'PAT':>7} {'Bine':>7} {'Bine/PAT':>9} {'Bine/Ring':>10}")
-for s in sizes:
-    r = avg(data['Ring'].get(s, [])); pt = avg(data['PAT'].get(s, [])); b = avg(data['Bine'].get(s, []))
-    print(f"{s:>13} {r:>7.2f} {pt:>7.2f} {b:>7.2f} {(b/pt if pt else 0):>9.2f} {(b/r if r else 0):>10.2f}")
-# overall avg-busbw (mean of per-run Avg lines) for a single headline number
-import re
-def avgline(algo):
-    vals=[]
-    for f in glob.glob(os.path.join(d, f"{algo}_rep*.log")):
-        for line in open(f):
-            m=re.search(r"Avg bus bandwidth\s*:\s*([\d.]+)", line)
-            if m: vals.append(float(m.group(1)))
-    return sum(vals)/len(vals) if vals else 0.0
-print(f"\nAvg-busbw headline:  Ring={avgline('Ring'):.3f}  PAT={avgline('PAT'):.3f}  Bine={avgline('Bine'):.3f}"
-      f"   (Bine/PAT={ (avgline('Bine')/avgline('PAT')) if avgline('PAT') else 0:.3f})")
-PY
+echo "=== SUMMARY: out-of-place busbw (GB/s) per size, mean over $REPS reps ==="
+# Portable awk (no gawk/python needed). Algo from filename; busbw_oop is field 8.
+awk '
+  FNR==1 { fn=FILENAME; sub(/.*\//,"",fn); sub(/_rep.*/,"",fn); algo=fn }
+  $3=="float" && ($1+0)>0 {
+    sz=$1+0; k=algo SUBSEP sz; sum[k]+=$8; cnt[k]++;
+    if(!(sz in seen)){ seen[sz]=1; szl[++nsz]=sz }
+  }
+  function av(a,z,   key){ key=a SUBSEP z; return (cnt[key]>0 ? sum[key]/cnt[key] : 0) }
+  END {
+    for(i=2;i<=nsz;i++){ v=szl[i]; j=i-1; while(j>=1 && szl[j]>v){ szl[j+1]=szl[j]; j-- } szl[j+1]=v }
+    printf "%14s %8s %8s %8s %9s %10s\n","size(B)","Ring","PAT","Bine","Bine/PAT","Bine/Ring"
+    for(i=1;i<=nsz;i++){ z=szl[i]; r=av("Ring",z); p=av("PAT",z); b=av("Bine",z)
+      printf "%14d %8.2f %8.2f %8.2f %9.2f %10.2f\n", z, r, p, b, (p>0?b/p:0), (r>0?b/r:0)
+    }
+  }
+' "$OUT"/*.log | tee "$OUT/summary.txt"
 
 echo ""
 echo "Done. Full logs + summary.txt in: $OUT"
