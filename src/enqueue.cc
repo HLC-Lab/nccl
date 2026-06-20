@@ -702,6 +702,9 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
 
       // Update number of channels propagated to the profiler
       task->nChannels = (uint8_t)nChannels;
+      if (task->func == ncclFuncAllGather)
+        INFO(NCCL_INIT, "BINE-CH AllGather count=%ld nMaxChannels=%d nChannels=%d commNChannels=%d",
+             (long)task->count, (int)task->nMaxChannels, nChannels, comm->nChannels);
 
       // Ensure room for worst case of one new batch per channel
       if (!ncclTestBudget(budget, plan->nWorkBatches + nChannels, plan->workBytes + workNode->size)) {

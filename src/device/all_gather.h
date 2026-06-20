@@ -150,7 +150,6 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
         step++;
         if (last == 2) break;
       }
-      if (ncclShmem.channelId == 0) printf("BINE-DIAG rank %d COMPUTE pollCount=%llu\n", rank, (unsigned long long)pollCount);
     } else if (tid < nworkers) {
       // Worker threads
       T* inputBuf = (T*)work->sendbuff;
@@ -180,8 +179,6 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
         if (last) break;
         step += nGroups;
       }
-      if (ncclShmem.channelId == 0 && group == 0 && tidInGroup == 0)
-        printf("BINE-DIAG rank %d WORKER pollCount=%llu\n", rank, (unsigned long long)pollCount);
     }
 #endif
   }
