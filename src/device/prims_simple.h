@@ -1092,11 +1092,9 @@ public:
     if (recv && (flags & RoleWaitRecv)) {
       ncclShmem.groups[group].srcs[0] =
         ((T*)peer->buff) + ((step + ps->stepOffset) % NCCL_STEPS) * peer->connStepSize + ps->recvOffset;
-      int spins = 0; long long dbgs = 0;
+      int spins = 0;
       while (peer->stepCache < step + ps->stepOffset + StepPerSlice) {
         peer->stepCache = loadStepValue(peer->tailPtr);
-        if (++dbgs == 500000000 && ncclShmem.channelId == 0)
-          printf("BINE-STUCK r%d RECV-wait recvDim=%d step=%d\n", ncclShmem.comm.rank, ps->recvDim, (int)step);
         if (checkAbort(flags, Aborted, spins)) break;
       }
       if (peer->accSize < ps->recvOffset + nelem + (step + ps->stepOffset) * peer->connStepSize) {
@@ -1107,11 +1105,9 @@ public:
       }
     }
     if (send && (flags & RoleWaitSend)) {
-      int spins = 0; long long dbgs = 0;
+      int spins = 0;
       while (peer->stepCache + NCCL_STEPS < step + StepPerSlice) {
         peer->stepCache = loadStepValue(peer->headPtr);
-        if (++dbgs == 500000000 && ncclShmem.channelId == 0)
-          printf("BINE-STUCK r%d SEND-wait sendDim=%d step=%d\n", ncclShmem.comm.rank, ps->sendDim, (int)step);
         if (checkAbort(flags, Aborted, spins)) break;
       }
       ncclShmem.groups[group].dsts[0] = ((T*)peer->buff) + (step % NCCL_STEPS) * peer->connStepSize + ps->sendOffset;

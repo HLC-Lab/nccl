@@ -138,8 +138,7 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
       PatAGAlgorithm<T> patAlgo(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, NCCL_STEPS,
                                 NCCL_PAT_NWORKERS / WARP_SIZE, channelOffset, channelOffset + channelCount, count,
                                 chunkCount, rank, nranks);
-      int parallelFactor = shmem->parallelFactor = patAlgo.getParallelFactor();
-      if (ncclShmem.channelId == 0) printf("BINE-DBG r%d CONSTRUCT-DONE pf=%d\n", rank, parallelFactor);
+      shmem->parallelFactor = patAlgo.getParallelFactor();
       int step = 0;
       while (1) {
         struct ncclPatStep* ps = shmem->patSteps + (step % NCCL_SHMEM_PAT_STEPS);
@@ -149,10 +148,8 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
         patAlgo.getNextOp(ps);
         int last = ps->last;
         step++;
-        if (ncclShmem.channelId == 0 && step == 200000) printf("BINE-DBG r%d COMPUTE-LOOPING step=%d (last never set?)\n", rank, step);
         if (last == 2) break;
       }
-      if (ncclShmem.channelId == 0) printf("BINE-DBG r%d COMPUTE-DONE step=%d\n", rank, step);
     } else if (tid < nworkers) {
       // Worker threads
       T* inputBuf = (T*)work->sendbuff;
@@ -182,7 +179,6 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
         if (last) break;
         step += nGroups;
       }
-      if (ncclShmem.channelId == 0 && group == 0 && tidInGroup == 0) printf("BINE-DBG r%d WORKER-DONE step=%d\n", rank, step);
     }
 #endif
   }
