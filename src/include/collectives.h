@@ -12,6 +12,7 @@
 #include "nccl_tuner.h"
 #include "device.h"
 #include "compiler.h"
+#include <stdlib.h> // abort() for the host-side op-list overflow guard (Bine AllGather)
 
 #define NCCL_MAX_NET_SIZE (1024 * 1024 * 1024L) // Rather than send INT_MAX which is 2G-1, send a power of two.
 
@@ -728,22 +729,34 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 
 // Bine FUSED RELAY-TREE AllGather (negabinary edges, PAT-style multi-peer width + fusion).
 // Each rank's block is broadcast down a tree of negabinary neighbours binePi(rank,k);
-// all n source-trees run together, scheduled by TREE DEPTH so a rank talks to up to
-// nsteps DIFFERENT peers per depth (the multi-peer width PAT has, the pairwise butterfly
-// lacks). Like PAT, a relayed block is RECEIVED AND FORWARDED in ONE fused op
-// (recvDim>=0 && sendDim>=0): patCopy reads the recv-FIFO once and writes BOTH the output
-// buffer and the child's send-FIFO -- halving copy/op cost vs separate recv+send. Op
-// kinds: INIT (own block input->output), FUSED (recv s from parent + forward to its first
-// child), SEND (extra forward of a held block, reads output), RECV (leaf receive). One
-// block per op (no packing; PAT's AG postFreq is 1 too). parallelFactor=1: concurrency is
-// cross-peer via the FIFO, not worker groups. sendDim/recvDim = step index k -> connection
-// peer binePi(rank,k) (generic.cc connects these; send-peer == recv-peer per dim).
+// all n source-trees run together. A rank talks to up to nsteps DIFFERENT peers (the
+// multi-peer width PAT has, the pairwise butterfly lacks). Like PAT, a relayed block is
+// RECEIVED AND FORWARDED in ONE fused op (recvDim>=0 && sendDim>=0): patCopy reads the
+// recv-FIFO once and writes BOTH the output buffer and the child's send-FIFO -- halving
+// copy/op cost vs separate recv+send. Op kinds: INIT (own block input->output), FUSED
+// (recv s from parent + forward to its first child), SEND (extra forward of a held block,
+// reads output), RECV (leaf receive). One block per op (no packing). parallelFactor=1:
+// concurrency is cross-peer via the FIFO, not worker groups. sendDim/recvDim = step index
+// k -> connection peer binePi(rank,k) (generic.cc connects these; send-peer == recv-peer
+// per dim).
+//
+// EMISSION ORDER = GLOBAL SOURCE ORDER (s = 0..nranks-1): a rank emits all of its ops for
+// block 0, then block 1, ... This is NOT for locality -- it is what makes the schedule
+// deadlock-free under NCCL's bounded (NCCL_STEPS-slot) FIFOs. On any connection r<->p the
+// block r sends and the block p receives both advance with the global index s, so the
+// sender never runs more than O(1) ops ahead of the partner's matching receive; the
+// pipeline fills across depths via the FIFO slack. (An earlier depth-ordered emission put
+// a full binomially-large depth-group of dim-0 sends ahead of the partner's matching
+// recvs, overflowing the 8-slot FIFO and deadlocking at nranks >= 64. Verified in
+// bench_bine/verify_schedule.py: source order is safe down to FIFO depth 2 for all po2
+// nranks <= 256; depth order deadlocks at n>=64.) INIT is no longer op 0 -- it sits at
+// s == rank -- but its own-block forwards still immediately follow it, and every SEND-only
+// op still comes after the op that gathered its block.
 //
 // The op list (kind/rdim/sdim/src) depends only on rank/nranks -> identical on
 // host(proxy, T=char) and device(kernel, T); byte offsets scale by sizeof(T). Built once
-// at construction (an O(n^2) tree walk on the single compute thread = fixed per-call
-// latency, negligible for large messages), replayed per chunk. Sized for po2 nRanks <= 256
-// (tuning.cc restricts use).
+// at construction (a single O(n log n) pass over the negabinary trees on the compute
+// thread), replayed per chunk. Sized for po2 nRanks <= 256 (tuning.cc restricts use).
 template <typename T>
 class PatAGAlgorithm {
   static const int RMAXOPS = 520; // >= ~1.5*nRanks for nRanks <= 256
@@ -781,21 +794,16 @@ class PatAGAlgorithm {
     }
     return no;
   }
-  __device__ __host__ bool inArr(int s, int* a, int c) { for (int i = 0; i < c; i++) if (a[i] == s) return true; return false; }
-  // Depth of 'rank' in source s's broadcast tree (hops s -> rank).
-  __device__ __host__ int depthOf(int s) {
-    if (s == rank) return 0;
-    int x = rank, d = 0, guard = 0, tmp[260];
-    while (x != s && guard++ < 2 * nranks) {
-      int f = -1;
-      for (int k = 0; k < nsteps; k++) { int c = getIdx(x, k, tmp); if (inArr(s, tmp, c)) { f = k; break; } }
-      if (f < 0) return -1;
-      x = binePi(x, f, nranks); d++;
-    }
-    return d;
-  }
   __device__ __host__ void push(int kind, int rd, int sd, int s) {
-    if (nOps >= RMAXOPS) return;
+    if (nOps >= RMAXOPS) {
+      // Must never happen for guarded po2 nRanks <= 256 (worst case 2n-1 = 511 < 520);
+      // fail loudly rather than silently drop an op (which would lose a block).
+#ifdef __CUDA_ARCH__
+      __trap();
+#else
+      abort();
+#endif
+    }
     opKind[nOps] = (unsigned char)kind; opRdim[nOps] = (signed char)rd; opSdim[nOps] = (signed char)sd;
     opSrc[nOps] = (short)s; nOps++;
   }
@@ -807,32 +815,32 @@ public:
     (void)slotBytes; (void)stepDepth; (void)maxParallelFactor;
     nsteps = log2Up(nranks);
     nelem = getNelem();
-    // Precompute: recv dim per source (krecv), child send-dims bitmask (cmask), tree depth.
-    signed char krecv[260]; unsigned char cmask[260]; int dof[260];
+    // Precompute per source block s: krecv[s] = the dim r receives s on (-1 if s==r),
+    // cmask[s] = bitmask of child dims r forwards s to. Both come from the negabinary
+    // trees: getIdx(rank,k) is the set r receives via dim k; getIdx(binePi(rank,k),k) is
+    // the set r forwards to its child on dim k.
+    signed char krecv[260]; unsigned char cmask[260];
     for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; }
     int set[260];
     for (int k = 0; k < nsteps; k++) {
       int c = getIdx(rank, k, set);                for (int i = 0; i < c; i++) krecv[set[i]] = (signed char)k; // r receives set[i] via dim k
       c = getIdx(binePi(rank, k, nranks), k, set); for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);     // r forwards set[i] to child dim k
     }
-    for (int s = 0; s < nranks; s++) dof[s] = depthOf(s);
-    int maxDepth = 0; for (int s = 0; s < nranks; s++) if (dof[s] > maxDepth) maxDepth = dof[s];
+    // Emit ops in GLOBAL SOURCE ORDER (see class comment): all ops for block s, for
+    // s = 0..nranks-1. Deadlock-free under bounded FIFOs (verify_schedule.py).
     nOps = 0;
-    push(0, -1, -1, rank); // INIT own block input -> output
-    for (int d = 0; d <= maxDepth; d++) {
-      for (int s = 0; s < nranks; s++) {
-        if (dof[s] != d) continue;
-        if (s == rank) {                       // own block (d==0): forward to every child
-          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s);
+    for (int s = 0; s < nranks; s++) {
+      if (s == rank) {
+        push(0, -1, -1, rank);                 // INIT: own block input -> output
+        for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // forward own block to every child
+      } else {
+        int first = -1;
+        for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) { first = k; break; }
+        if (first >= 0) {
+          push(3, krecv[s], first, s);         // FUSED: recv s from parent + forward to first child
+          for (int k = first + 1; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards (read output)
         } else {
-          int first = -1;
-          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) { first = k; break; }
-          if (first >= 0) {
-            push(3, krecv[s], first, s);         // FUSED: recv s from parent + forward to first child
-            for (int k = first + 1; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards (read output)
-          } else {
-            push(2, krecv[s], -1, s);            // leaf: receive only
-          }
+          push(2, krecv[s], -1, s);            // leaf: receive only
         }
       }
     }
