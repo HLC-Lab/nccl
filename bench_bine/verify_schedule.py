@@ -518,15 +518,20 @@ def run_phase2():
     return ok
 
 
-def mode_of(n, slot_bytes, chunk_bytes):
-    """Mirror of the C++ mode selection (integer arithmetic must match exactly)."""
+BINE_BUTTERFLY_MAX_BYTES = 256 * 1024  # must match src/include/collectives.h
+
+
+def mode_of(n, slot_bytes, chunk_bytes, per_rank_bytes):
+    """Mirror of the C++ mode selection (integer arithmetic must match exactly).
+    Butterfly iff per-rank message <= threshold AND packing is deadlock-safe."""
     pf = (slot_bytes // chunk_bytes) if chunk_bytes > 0 else 1
     if pf < 1:
         pf = 1
     if pf > n // 2:
         pf = n // 2
     min_post = (n // 2 + NCCL_STEPS - 1) // NCCL_STEPS  # divUp(n/2, NCCL_STEPS)
-    return pf, (pf >= min_post)
+    use_bf = (per_rank_bytes <= BINE_BUTTERFLY_MAX_BYTES) and (pf >= min_post)
+    return pf, use_bf
 
 
 def run_phase4():
@@ -541,14 +546,14 @@ def run_phase4():
         # chunk arithmetic (nelem clamp + last=2 timing) is mode-independent, but
         # exercise it through the Butterfly op list too.
         cerrs = chunk_checks(n, Butterfly, postFreq=minP)
-        # mode selection. For n<=16 divUp(n/2,8)==1 so the threshold is always met ->
-        # butterfly at EVERY size (small-n has little relay/multi-peer benefit anyway).
-        # For n>=32 it is a true hybrid: large chunk (postFreq->1) uses the relay, tiny
-        # chunk uses the butterfly.
+        # mode selection: gated on PER-RANK bytes (channel-invariant). Verify (a) small
+        # per-rank -> butterfly, large per-rank -> relay, and (b) the choice does NOT
+        # depend on chunk size (i.e. on channel count) -- each set below must be a
+        # singleton. This is the property the old postFreq-only gate violated.
         SLOT = 1 << 20
-        _, big_bf = mode_of(n, SLOT, SLOT)           # chunk == slot -> postFreq 1
-        _, small_bf = mode_of(n, SLOT, 64)           # tiny chunk -> large postFreq
-        msel_ok = (big_bf and small_bf) if n <= 16 else ((not big_bf) and small_bf)
+        small_modes = {mode_of(n, SLOT, cb, 64 * 1024)[1] for cb in (4096, 16384, 65536)}
+        large_modes = {mode_of(n, SLOT, cb, 16 << 20)[1] for cb in (65536, 262144, 1 << 20)}
+        msel_ok = (small_modes == {True}) and (large_modes == {False})
         good = (not e and all(x == 'OK' for x in res) and r3 == 'OK'
                 and not cerrs and msel_ok)
         ok &= good

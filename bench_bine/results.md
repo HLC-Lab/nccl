@@ -431,3 +431,54 @@ channel tuning (auto-tuning would need the tuning.cc model updated — known Pha
 item); (b) small/mid remains THE gap and is unaffected by channels -> Phase 4
 butterfly hybrid is the next code change; (c) optional: ch=4/8 sweep to map the
 crossover; 128-node point still pending.
+
+## 2026-07-09 — v9: Phase 4 relay+butterfly HYBRID, 64 nodes
+
+Hybrid in one PatAGAlgorithm (commit fbc90c5): butterfly (packed pairwise, pico
+allgather_bine_block_by_block) for small/mid, skewed relay for large. First cut
+selected the mode by postFreq.
+
+### v9 default channels — butterfly HELPS small/mid, large unchanged (clean win)
+
+N=64, -n 10, 1 rep, 0 #wrong. vs the v8b relay-only default-channel run:
+
+| size    | PAT  | v8b relay | v9 hybrid | v9/PAT | v8b/PAT |
+|---------|-----:|----------:|----------:|-------:|--------:|
+| 1 MB    | 4.42 |      1.28 |      2.00 |  0.45  |  0.31   |
+| 4 MB    | 7.26 |      3.88 |      5.45 |  0.75  |  0.54   |
+| 8 MB    | 8.40 |     ~5.4  |      6.10 |  0.73  |  ~0.65  |
+| 16 MB   | 9.15 |      6.55 |      6.54 |  0.71  |  0.72   |
+| 32 MB   | 8.79 |      7.32 |      7.29 |  0.83  |  0.90   |
+| 1 GB    | 9.33 |      8.54 |      8.21 |  0.88  |  0.90   |
+
+Butterfly lifts 1 MB 0.31->0.45 and 4 MB 0.54->0.75; large (>=16 MB) unchanged
+(relay). Net improvement at default channels, no regression.
+
+### v9 FORCED 16 channels — REGRESSION at large: postFreq gate is channel-sensitive
+
+N=64, NCCL_FORCE_CH=16, -n 10, 1 rep, 0 #wrong. vs v8b relay-only forced-16ch:
+
+| size    | PAT  | v8b relay-16ch | v9 hybrid-16ch |
+|---------|-----:|---------------:|---------------:|
+| 1 MB    | 1.32 |           0.18 |           1.31 |   <- butterfly: 7x small win
+| 128 MB  | 4.49 |           9.22 |           4.72 |
+| 1 GB    | 8.22 |          10.16 |           5.98 |   <- REGRESSION (10.2 -> 6.0)
+
+DIAGNOSIS: the relay path is byte-identical to v8b, so 1 GB = 5.98 (not ~10) proves
+the BUTTERFLY was selected at 1 GB. Root cause: postFreq = slotBytes/chunkBytes is
+per-CHANNEL; 16 channels shrink the chunk, raise postFreq, and trip the butterfly
+switch even for a 1 GB message -> butterfly's pairwise bandwidth limit bites (the
+regime the relay exists for). Small win is real and large (butterfly-mode 1 GB 5.98)
+matches the old pure-butterfly numbers.
+
+### FIX (same commit series): gate on PER-RANK message size, not postFreq
+
+useButterfly = (count*sizeof(T) <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost).
+count*sizeof(T) = per-rank bytes: identical host/device AND channel-count-invariant, so
+the same total message picks the same mode at 2 or 16 channels. postFreq>=minPost kept
+as the deadlock-safety floor. BINE_BUTTERFLY_MAX_BYTES=256KB/rank (first cut from the
+default-channel crossover; tune with BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds).
+Offline gates pass (byte-identical op lists, channel-invariant mode selection). NEEDS
+HARDWARE RE-RUN: expect the default-channel small/mid wins preserved AND forced-16ch
+1 GB back to ~10 (relay), i.e. best-of-both: butterfly small + relay large at any
+channel count.

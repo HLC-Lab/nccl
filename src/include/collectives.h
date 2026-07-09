@@ -739,8 +739,10 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 //   BUTTERFLY (small/mid messages): pico's allgather_bine_block_by_block -- log2(n) rounds
 //     of pairwise exchange with partner binePi(rank,t), packing postFreq blocks into each
 //     FIFO slot so one network post covers many blocks. Latency-optimal where the relay's
-//     one-post-per-block cost dominates. Safe only when a slot holds enough of the largest
-//     round (postFreq >= divUp(nranks/2, NCCL_STEPS)); that is exactly the switch condition.
+//     one-post-per-block cost dominates. Selected when the PER-RANK message size
+//     (count*sizeof(T), channel-count-invariant) <= BINE_BUTTERFLY_MAX_BYTES, provided a
+//     slot can hold enough of the largest round to be deadlock-free (postFreq >=
+//     divUp(nranks/2, NCCL_STEPS)); otherwise the relay runs.
 //
 // Op kinds (both modes): INIT (own block input->output), FUSED (recv+forward, relay only),
 // SEND-only (forward a held block, reads output), RECV-only (leaf/plain receive). Each op
@@ -782,6 +784,13 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // mirror in bench_bine/verify_schedule.py; changing it requires re-running the phase2
 // gate there (liveness) and bench_bine/timed_sim.py (throughput model).
 #define BINE_SKEW_LAMBDA 6
+
+// Butterfly (packed pairwise) is used when the PER-RANK message is at or below this many
+// bytes; above it the multi-peer relay wins. Channel-count-invariant (see mode selection
+// in the constructor). First-cut crossover from the 64-node default-channel sweep; refine
+// with the BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds. Keep in lockstep with the
+// mirror in bench_bine/verify_schedule.py.
+#define BINE_BUTTERFLY_MAX_BYTES (256 * 1024)
 
 template <typename T>
 class PatAGAlgorithm {
@@ -868,17 +877,24 @@ public:
     int postFreq = (chunkBytes > 0) ? (slotBytes / chunkBytes) : 1;
     if (postFreq < 1) postFreq = 1;
     if (postFreq > nranks / 2) postFreq = nranks / 2;
-    // Mode: the butterfly (packed pairwise, few network posts) wins the small/mid,
-    // latency-bound regime; the skewed relay (multi-peer width, one block per post)
-    // wins large. The butterfly's largest round moves nranks/2 blocks on ONE
-    // connection, so it is deadlock-safe only when a slot holds enough of them.
     int minPost = (nranks / 2 + NCCL_STEPS - 1) / NCCL_STEPS; // divUp(nranks/2, NCCL_STEPS)
+    // Mode selection. The butterfly (packed pairwise, few network posts) wins the
+    // small/mid latency-bound regime; the skewed relay (multi-peer width) wins large.
+    // GATE ON PER-RANK MESSAGE SIZE, not on postFreq: count*sizeof(T) is the per-rank
+    // byte count -- identical on host (T=char) and device, and INDEPENDENT of channel
+    // count. An earlier postFreq-only gate was channel-SENSITIVE (more channels ->
+    // smaller chunks -> higher postFreq) and wrongly picked the butterfly for large
+    // messages under many channels: measured 1 GB regression 10.2 -> 6.0 GB/s at 16
+    // channels (64 nodes, Leonardo). postFreq >= minPost stays as the packing-safety
+    // floor (below it the butterfly deadlocks). BINE_BUTTERFLY_MAX_BYTES is a first-cut
+    // crossover from the default-channel sweep; refine with the BINE_FORCE_* builds.
+    size_t perRankBytes = count * sizeof(T);
 #if defined(BINE_FORCE_RELAY)
     bool useButterfly = false;
 #elif defined(BINE_FORCE_BUTTERFLY)
-    bool useButterfly = true;   // benchmarking only: deadlocks unless postFreq >= minPost
+    bool useButterfly = (postFreq >= minPost);   // benchmarking: butterfly wherever it is SAFE
 #else
-    bool useButterfly = (postFreq >= minPost);
+    bool useButterfly = (perRankBytes <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost);
 #endif
 
     nOps = 0;

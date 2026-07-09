@@ -203,21 +203,28 @@ construction cost removed) but likely still trail PAT — that is Phase 4.
 
 ## Phase 4 — small/mid performance: butterfly mode (hybrid)
 
-> **IMPLEMENTED 2026-07-09 (commit pending).** Butterfly+relay hybrid in one
-> class, mode picked at construction from `postFreq = slotBytes/(chunkCount*
-> sizeof(T))`: `useButterfly = postFreq >= divUp(nranks/2, NCCL_STEPS)`.
-> Per-op `opSlotPos`/`opPost` arrays added; `getNextOp` sets
-> `recvOffset/sendOffset = slotPos*nelem` and posts per `opPost`. Relay path
-> uses slotPos 0 / post-every-op (byte-identical to pre-Phase-4). Compile
-> overrides `BINE_FORCE_RELAY` / `BINE_FORCE_BUTTERFLY`. Real C++ effective op
-> lists verified byte-identical to the mirror for relay + butterfly at all po2
-> n≤256 and pack factors; `verify_schedule.py all` PASSES (static, FIFO
-> liveness incl. the below-minP deadlock, chunk arithmetic, mode selection).
-> **CAVEAT (tuning, revisit with hardware data):** for n≤16, `divUp(n/2,8)==1`,
-> so the switch is always met → butterfly is used at EVERY message size (no
-> relay). Historically fine (small-n butterfly was competitive at large too),
-> but if a 16-node large-message run regresses vs the pre-Phase-4 relay, add a
-> message-size term to the switch. Hardware validation below is still required.
+> **IMPLEMENTED 2026-07-09.** Butterfly+relay hybrid in one class. Per-op
+> `opSlotPos`/`opPost` arrays added; `getNextOp` sets `recvOffset/sendOffset =
+> slotPos*nelem` and posts per `opPost`. Relay path uses slotPos 0 /
+> post-every-op (byte-identical to pre-Phase-4). Compile overrides
+> `BINE_FORCE_RELAY` / `BINE_FORCE_BUTTERFLY` (the latter = butterfly wherever
+> deadlock-safe). Verified: C++ effective op lists byte-identical to the mirror
+> for relay + butterfly at all po2 n≤256 and pack factors; `verify_schedule.py
+> all` PASSES (static, FIFO liveness incl. below-minP deadlock, chunk
+> arithmetic, mode selection + channel-invariance).
+>
+> **MODE SELECTION — corrected after the first 64-node hardware run.** First
+> cut gated purely on `postFreq >= divUp(nranks/2, NCCL_STEPS)`. That is
+> channel-SENSITIVE (more channels → smaller per-channel chunks → higher
+> postFreq), and the forced-16-channel run picked the butterfly for LARGE
+> messages, regressing 1 GB from 10.2 to 6.0 GB/s (the butterfly's pairwise
+> bandwidth limit — exactly what the relay exists to avoid). Fix: gate on the
+> **per-rank message size** `count*sizeof(T) <= BINE_BUTTERFLY_MAX_BYTES`
+> (256 KB first cut) — channel-count-INVARIANT and host/device-consistent —
+> with `postFreq >= minPost` kept only as the packing-safety floor. The
+> `BINE_BUTTERFLY_MAX_BYTES` crossover is a first cut from the default-channel
+> sweep; refine with the `BINE_FORCE_*` builds (see below). Note: this replaces
+> the earlier "n≤16 always-butterfly" behavior with a size-based one for all n.
 
 **Why**: the relay posts one block per FIFO slot and per network message;
 upstream PAT packs many small blocks per slot (`postFreq`) — that is the
