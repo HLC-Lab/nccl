@@ -283,6 +283,25 @@ class Butterfly(RelayBase):
                 self.meta.append((j % postFreq, post))
 
 
+def norm_ops(algo):
+    """Effective per-op schedule tuple (K, rd, sd, s, slotPos, postSend, postRecv)
+    -- the fields that actually drive ncclPatStep. Works for any mirror: reads
+    algo.meta (slotPos, post) if present (butterfly), else relay defaults."""
+    meta = getattr(algo, 'meta', None)
+    out = []
+    for i, (K, rd, sd, s) in enumerate(algo.ops):
+        if meta is not None:
+            slot, post = meta[i]
+            postS = 1 if (sd >= 0 and post) else 0
+            postR = 1 if (rd >= 0 and post) else 0
+        else:
+            slot = 0
+            postS = 1 if sd >= 0 else 0
+            postR = 1 if rd >= 0 else 0
+        out.append((K, rd, sd, s, slot, postS, postR))
+    return out
+
+
 # --------------------------- checks ---------------------------------------
 
 def static_checks(n, cls, **kw):
@@ -499,6 +518,17 @@ def run_phase2():
     return ok
 
 
+def mode_of(n, slot_bytes, chunk_bytes):
+    """Mirror of the C++ mode selection (integer arithmetic must match exactly)."""
+    pf = (slot_bytes // chunk_bytes) if chunk_bytes > 0 else 1
+    if pf < 1:
+        pf = 1
+    if pf > n // 2:
+        pf = n // 2
+    min_post = (n // 2 + NCCL_STEPS - 1) // NCCL_STEPS  # divUp(n/2, NCCL_STEPS)
+    return pf, (pf >= min_post)
+
+
 def run_phase4():
     print("== phase4 (butterfly, packed) - ALL gates must pass ==")
     ok = True
@@ -508,10 +538,23 @@ def run_phase4():
         res = [butterfly_sim(n, P) for P in {minP, minP * 2, max(n // 2, 1)}]
         r3 = butterfly_sim(n, minP, nchunks=3)
         below = butterfly_sim(n, minP // 2) if minP > 1 else 'n/a'
-        good = not e and all(x == 'OK' for x in res) and r3 == 'OK'
+        # chunk arithmetic (nelem clamp + last=2 timing) is mode-independent, but
+        # exercise it through the Butterfly op list too.
+        cerrs = chunk_checks(n, Butterfly, postFreq=minP)
+        # mode selection. For n<=16 divUp(n/2,8)==1 so the threshold is always met ->
+        # butterfly at EVERY size (small-n has little relay/multi-peer benefit anyway).
+        # For n>=32 it is a true hybrid: large chunk (postFreq->1) uses the relay, tiny
+        # chunk uses the butterfly.
+        SLOT = 1 << 20
+        _, big_bf = mode_of(n, SLOT, SLOT)           # chunk == slot -> postFreq 1
+        _, small_bf = mode_of(n, SLOT, 64)           # tiny chunk -> large postFreq
+        msel_ok = (big_bf and small_bf) if n <= 16 else ((not big_bf) and small_bf)
+        good = (not e and all(x == 'OK' for x in res) and r3 == 'OK'
+                and not cerrs and msel_ok)
         ok &= good
         print(f"n={n:4d}: static {'OK' if not e else 'FAIL'}  minP={minP:3d}  "
-              f"sim: {res} 3ch:{r3}  belowMinP(expect DEADLOCK): {below}"
+              f"sim: {res} 3ch:{r3}  chunks:{'OK' if not cerrs else 'FAIL'}  "
+              f"modesel:{'OK' if msel_ok else 'FAIL'}  belowMinP(expect DEADLOCK): {below}"
               + ('' if good else '   <<< FAIL'))
     return ok
 

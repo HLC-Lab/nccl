@@ -727,18 +727,30 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
-// Bine FUSED RELAY-TREE AllGather (negabinary edges, PAT-style multi-peer width + fusion).
-// Each rank's block is broadcast down a tree of negabinary neighbours binePi(rank,k);
-// all n source-trees run together. A rank talks to up to nsteps DIFFERENT peers (the
-// multi-peer width PAT has, the pairwise butterfly lacks). Like PAT, a relayed block is
-// RECEIVED AND FORWARDED in ONE fused op (recvDim>=0 && sendDim>=0): patCopy reads the
-// recv-FIFO once and writes BOTH the output buffer and the child's send-FIFO -- halving
-// copy/op cost vs separate recv+send. Op kinds: INIT (own block input->output), FUSED
-// (recv s from parent + forward to its first child), SEND (extra forward of a held block,
-// reads output), RECV (leaf receive). One block per op (no packing). parallelFactor=1:
-// concurrency is cross-peer via the FIFO, not worker groups. sendDim/recvDim = step index
-// k -> connection peer binePi(rank,k) (generic.cc connects these; send-peer == recv-peer
-// per dim).
+// Bine AllGather over negabinary edges. TWO SCHEDULES, one op-list class, picked at
+// construction from the chunk size (see postFreq / useButterfly in the constructor):
+//
+//   RELAY (large messages): each rank's block is broadcast down a tree of negabinary
+//     neighbours binePi(rank,k); all n source-trees run together, so a rank talks to up
+//     to nsteps DIFFERENT peers (the multi-peer width PAT has, the pairwise butterfly
+//     lacks) -- this is what beats PAT at large sizes. A relayed block is RECEIVED AND
+//     FORWARDED in ONE fused op (recvDim>=0 && sendDim>=0): patCopy reads the recv-FIFO
+//     once and writes BOTH the output and the child's send-FIFO. One block per FIFO slot.
+//   BUTTERFLY (small/mid messages): pico's allgather_bine_block_by_block -- log2(n) rounds
+//     of pairwise exchange with partner binePi(rank,t), packing postFreq blocks into each
+//     FIFO slot so one network post covers many blocks. Latency-optimal where the relay's
+//     one-post-per-block cost dominates. Safe only when a slot holds enough of the largest
+//     round (postFreq >= divUp(nranks/2, NCCL_STEPS)); that is exactly the switch condition.
+//
+// Op kinds (both modes): INIT (own block input->output), FUSED (recv+forward, relay only),
+// SEND-only (forward a held block, reads output), RECV-only (leaf/plain receive). Each op
+// carries opSlotPos (byte offset within its shared slot = slotPos*nelem) and opPost (which
+// of postSend/postRecv fire); relay uses slotPos 0 and posts every op. parallelFactor=1 in
+// both modes: concurrency is cross-peer via the FIFO, not worker groups. sendDim/recvDim =
+// step index k -> connection peer binePi(rank,k) (generic.cc connects these; send-peer ==
+// recv-peer per dim), so BOTH schedules reuse the same connections and proxy step-counter.
+//
+// The RELAY emission order matters for deadlock-freedom under bounded FIFOs:
 //
 // EMISSION ORDER = SKEWED SOURCE ORDER: blocks are emitted in ascending
 // key(s) = s + BINE_SKEW_LAMBDA * depth(s), ties by s, where depth(s) is this rank's
@@ -788,11 +800,20 @@ class PatAGAlgorithm {
   signed char opRdim[RMAXOPS];   // recv dim (-1 if none) -> recv from binePi(rank,opRdim)
   signed char opSdim[RMAXOPS];   // send dim (-1 if none) -> send to  binePi(rank,opSdim)
   unsigned char opKind[RMAXOPS]; // 0 INIT, 1 SEND-only, 2 RECV-only, 3 FUSED (recv+send)
+  unsigned char opSlotPos[RMAXOPS]; // block's position within its FIFO slot (0..postFreq-1)
+  unsigned char opPost[RMAXOPS];    // bit0 = postSend, bit1 = postRecv on this op
   int nOps;
   int ip;                        // current op index within the chunk
 
   __device__ __host__ ssize_t imin(ssize_t a, ssize_t b) { return (a < b) ? a : b; }
   __device__ __host__ int getNelem() { return (int)imin(chunkCount, end - offset); }
+
+  // Ascending insertion sort (m small: <= nranks/2). Butterfly send/recv runs are
+  // enumerated in the same order on both endpoints, so sorting is only to keep the
+  // C++ list byte-identical to the Python mirror; either order would be consistent.
+  __device__ __host__ void sortAsc(int* a, int m) {
+    for (int i = 1; i < m; i++) { int v = a[i], j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
+  }
 
   // Enumerate get_indexes(start,st) in DFS pre-order into out[]; returns count.
   // If dep != nullptr, dep[i] = tree depth of out[i] below 'start' (e0 has depth 1);
@@ -814,10 +835,12 @@ class PatAGAlgorithm {
     }
     return no;
   }
-  __device__ __host__ void push(int kind, int rd, int sd, int s) {
+  // slotPos = block's offset within its shared FIFO slot; postBits bit0=postSend,
+  // bit1=postRecv. Relay defaults (0, both bits): one block per slot, post every op.
+  __device__ __host__ void push(int kind, int rd, int sd, int s, int slotPos = 0, int postBits = 3) {
     if (nOps >= RMAXOPS) {
-      // Must never happen for guarded po2 nRanks <= 256 (worst case 2n-1 = 511 < 520);
-      // fail loudly rather than silently drop an op (which would lose a block).
+      // Must never happen for guarded po2 nRanks <= 256 (relay worst case 2n-1 = 511,
+      // butterfly 2n-1 = 511, both < 520); fail loudly rather than silently drop an op.
 #ifdef __CUDA_ARCH__
       __trap();
 #else
@@ -825,55 +848,101 @@ class PatAGAlgorithm {
 #endif
     }
     opKind[nOps] = (unsigned char)kind; opRdim[nOps] = (signed char)rd; opSdim[nOps] = (signed char)sd;
-    opSrc[nOps] = (short)s; nOps++;
+    opSrc[nOps] = (short)s; opSlotPos[nOps] = (unsigned char)slotPos; opPost[nOps] = (unsigned char)postBits;
+    nOps++;
   }
 
 public:
   __device__ __host__ PatAGAlgorithm(int slotBytes, int stepDepth, int maxParallelFactor, size_t offset, size_t end,
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
-    (void)slotBytes; (void)stepDepth; (void)maxParallelFactor;
+    (void)stepDepth; (void)maxParallelFactor;
     nsteps = log2Up(nranks);
     nelem = getNelem();
-    // Precompute per source block s: krecv[s] = the dim r receives s on (-1 if s==r),
-    // dof[s] = r's depth in s's broadcast tree (free from the same DFS), and
-    // cmask[s] = bitmask of child dims r forwards s to. All from the negabinary trees:
-    // getIdx(rank,k) is the set r receives via dim k; getIdx(binePi(rank,k),k) is the
-    // set r forwards to its child on dim k.
-    signed char krecv[260]; unsigned char cmask[260]; short dof[260];
-    for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; dof[s] = 0; }
-    int set[260], dep[260];
-    for (int k = 0; k < nsteps; k++) {
-      int c = getIdx(rank, k, set, dep);
-      for (int i = 0; i < c; i++) { krecv[set[i]] = (signed char)k; dof[set[i]] = (short)dep[i]; } // r receives set[i] via dim k
-      c = getIdx(binePi(rank, k, nranks), k, set);
-      for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);                                      // r forwards set[i] to child dim k
-    }
-    // Emit blocks in SKEWED SOURCE ORDER (see class comment): ascending
-    // key(s) = s + BINE_SKEW_LAMBDA*dof[s], ties broken by smaller s.
-    // O(n^2) selection scan; trivial next to the data movement.
+
+    // postFreq = blocks packed into one FIFO slot / one network post. Computed
+    // identically on host (T=char, chunkCount in bytes) and device (chunkCount in
+    // elements, *sizeof(T)) since both equal the chunk byte size, keeping the two
+    // op lists in lockstep. Clamp to [1, nranks/2] (n/2 = largest butterfly round).
+    int chunkBytes = chunkCount * (int)sizeof(T);
+    int postFreq = (chunkBytes > 0) ? (slotBytes / chunkBytes) : 1;
+    if (postFreq < 1) postFreq = 1;
+    if (postFreq > nranks / 2) postFreq = nranks / 2;
+    // Mode: the butterfly (packed pairwise, few network posts) wins the small/mid,
+    // latency-bound regime; the skewed relay (multi-peer width, one block per post)
+    // wins large. The butterfly's largest round moves nranks/2 blocks on ONE
+    // connection, so it is deadlock-safe only when a slot holds enough of them.
+    int minPost = (nranks / 2 + NCCL_STEPS - 1) / NCCL_STEPS; // divUp(nranks/2, NCCL_STEPS)
+#if defined(BINE_FORCE_RELAY)
+    bool useButterfly = false;
+#elif defined(BINE_FORCE_BUTTERFLY)
+    bool useButterfly = true;   // benchmarking only: deadlocks unless postFreq >= minPost
+#else
+    bool useButterfly = (postFreq >= minPost);
+#endif
+
     nOps = 0;
-    unsigned char emitted[260];
-    for (int s = 0; s < nranks; s++) emitted[s] = 0;
-    for (int e = 0; e < nranks; e++) {
-      int s = -1, bestKey = 0x7fffffff;
-      for (int x = 0; x < nranks; x++) {
-        if (emitted[x]) continue;
-        int key = x + BINE_SKEW_LAMBDA * (int)dof[x];
-        if (key < bestKey) { bestKey = key; s = x; }     // strict '<': equal keys resolve to smaller x
+    if (useButterfly) {
+      // ---- Butterfly: pico allgather_bine_block_by_block (packed) ----
+      // Rounds t = nsteps-1..0, partner p = binePi(rank,t) on connection dim t:
+      // send the blocks p needs (getIdx(p,t), already gathered), then receive the
+      // blocks r needs (getIdx(r,t)). Per-connection order matches because both
+      // endpoints enumerate the same sorted set. postFreq blocks share a slot.
+      int sbuf[260], rbuf[260];
+      push(0, -1, -1, rank);                   // INIT: own block input -> output
+      for (int t = nsteps - 1; t >= 0; t--) {
+        int partner = binePi(rank, t, nranks);
+        int ns = getIdx(partner, t, sbuf); sortAsc(sbuf, ns);   // blocks r sends to partner
+        int nr = getIdx(rank, t, rbuf);    sortAsc(rbuf, nr);   // blocks r receives from partner
+        for (int j = 0; j < ns; j++) {
+          int post = (j % postFreq == postFreq - 1) || (j == ns - 1);
+          push(1, -1, t, sbuf[j], j % postFreq, post ? 1 : 0);  // SEND-only (bit0 = postSend)
+        }
+        for (int j = 0; j < nr; j++) {
+          int post = (j % postFreq == postFreq - 1) || (j == nr - 1);
+          push(2, t, -1, rbuf[j], j % postFreq, post ? 2 : 0);  // RECV-only (bit1 = postRecv)
+        }
       }
-      emitted[s] = 1;
-      if (s == rank) {
-        push(0, -1, -1, rank);                 // INIT: own block input -> output
-        for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // forward own block to every child
-      } else {
-        int first = -1;
-        for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) { first = k; break; }
-        if (first >= 0) {
-          push(3, krecv[s], first, s);         // FUSED: recv s from parent + forward to first child
-          for (int k = first + 1; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards (read output)
+    } else {
+      // ---- Skewed source-order relay (see class comment) ----
+      // Precompute per source block s: krecv[s] = the dim r receives s on (-1 if
+      // s==r), dof[s] = r's depth in s's broadcast tree (free from the same DFS),
+      // cmask[s] = bitmask of child dims r forwards s to. From the negabinary trees:
+      // getIdx(rank,k) is the set r receives via dim k; getIdx(binePi(rank,k),k) is
+      // the set r forwards to its child on dim k.
+      signed char krecv[260]; unsigned char cmask[260]; short dof[260];
+      for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; dof[s] = 0; }
+      int set[260], dep[260];
+      for (int k = 0; k < nsteps; k++) {
+        int c = getIdx(rank, k, set, dep);
+        for (int i = 0; i < c; i++) { krecv[set[i]] = (signed char)k; dof[set[i]] = (short)dep[i]; }
+        c = getIdx(binePi(rank, k, nranks), k, set);
+        for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);
+      }
+      // Emit blocks by ascending key(s) = s + BINE_SKEW_LAMBDA*dof[s], ties by smaller
+      // s. O(n^2) selection scan; trivial next to the data movement.
+      unsigned char emitted[260];
+      for (int s = 0; s < nranks; s++) emitted[s] = 0;
+      for (int e = 0; e < nranks; e++) {
+        int s = -1, bestKey = 0x7fffffff;
+        for (int x = 0; x < nranks; x++) {
+          if (emitted[x]) continue;
+          int key = x + BINE_SKEW_LAMBDA * (int)dof[x];
+          if (key < bestKey) { bestKey = key; s = x; }     // strict '<': equal keys -> smaller x
+        }
+        emitted[s] = 1;
+        if (s == rank) {
+          push(0, -1, -1, rank);                 // INIT: own block input -> output
+          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // forward own block to every child
         } else {
-          push(2, krecv[s], -1, s);            // leaf: receive only
+          int first = -1;
+          for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) { first = k; break; }
+          if (first >= 0) {
+            push(3, krecv[s], first, s);         // FUSED: recv s from parent + forward to first child
+            for (int k = first + 1; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards (read output)
+          } else {
+            push(2, krecv[s], -1, s);            // leaf: receive only
+          }
         }
       }
     }
@@ -887,12 +956,15 @@ public:
     ps->stepOffset = 0; ps->postRecv = 0; ps->postSend = 0; ps->inpIx = 0; ps->outIx = 0;
     nelem = getNelem(); ps->nelem = nelem;
     int K = opKind[ip], rd = opRdim[ip], sd = opSdim[ip], s = opSrc[ip];
+    int slotPos = opSlotPos[ip], postBits = opPost[ip];
     if (K == 0) {                                              // INIT: own block input -> output[rank]
       ps->inpIx = offset; ps->outIx = (size_t)rank * count + offset;
     } else {
-      // FUSED sets both; SEND-only sets send; RECV-only sets recv. One block per op (no packing).
-      if (rd >= 0) { ps->recvDim = rd; ps->outIx = (size_t)s * count + offset; ps->postRecv = 1; }
-      if (sd >= 0) { ps->sendDim = sd; ps->inpIx = (size_t)s * count + offset; ps->postSend = 1; }
+      // FUSED sets both; SEND-only sets send; RECV-only sets recv. postFreq blocks share a
+      // slot: byte offset slotPos*nelem, and post only on the pack's last block (opPost).
+      // Relay: slotPos 0, opPost = both bits -> one block per slot, post every op (unchanged).
+      if (rd >= 0) { ps->recvDim = rd; ps->outIx = (size_t)s * count + offset; ps->recvOffset = slotPos * nelem; if (postBits & 2) ps->postRecv = 1; }
+      if (sd >= 0) { ps->sendDim = sd; ps->inpIx = (size_t)s * count + offset; ps->sendOffset = slotPos * nelem; if (postBits & 1) ps->postSend = 1; }
     }
     ip++;
     if (ip >= nOps) {
