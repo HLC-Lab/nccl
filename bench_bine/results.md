@@ -400,3 +400,34 @@ regime as the healthy 16-node v7 runs (0.89-0.96), so the scaling pathology is g
 fix. NEXT: (a) forced-channels 3-way at 64n (historically Bine +10% over PAT at
 16ch, equal channels); (b) 128-node point (sim says live; would fully retire the
 deadlock question); (c) Phase 4 butterfly for small/mid.
+
+### v8b + NCCL_FORCE_CH=16, 64 nodes — BINE BEATS PAT >=128 MB (+7..23%); channels hurt small/mid
+
+Same build (666265e), N=64, -n 10, 1 rep, 0 #wrong, forced 16 channels all three
+(different allocation than the default-channel run):
+
+| size    |  Ring |  PAT  | Bine  | Bine/PAT |
+|---------|------:|------:|------:|---------:|
+| 1 MB    |  1.86 |  1.61 |  0.18 |   0.11   |
+| 8 MB    |  4.90 |  5.67 |  1.58 |   0.28   |
+| 32 MB   |  9.76 |  8.55 |  5.34 |   0.62   |
+| 64 MB   |  7.58 |  9.01 |  7.99 |   0.89   |
+| 128 MB  | 11.80 |  8.41 |  9.22 |   1.10   |
+| 256 MB  | 12.18 |  7.66 |  9.45 |   1.23   |
+| 512 MB  | 12.22 |  8.41 |  9.00 |   1.07   |
+| 1 GB    | 12.17 |  8.54 | 10.16 |   1.19   |
+| **avg** |  3.10 |  2.70 |  2.05 |   0.76   |
+
+READ: the multi-peer-width advantage SURVIVES AT 64 NODES: with equal 16 channels
+Bine wins every size >=128 MB (peak 10.16 vs PAT 8.54 = +19%; crossover ~100 MB),
+and Bine's best config beats PAT's best config at 1 GB (10.16 vs 9.51 default-ch =
++7%). Channels scale Bine UP at large (8.54 -> 10.16) while PAT goes DOWN
+(9.51 -> 8.54). BUT 16ch degrades small/mid for ALL algos (PAT 1 MB 4.10 -> 1.61;
+Bine 1.28 -> 0.18; per-channel slices go latency-bound), so channel count is a
+per-size knob: default channels win <=64 MB, 16ch wins >=128 MB. Bine is hurt MORE
+by many channels at small sizes (fixed per-op stalls x parallelFactor=1 replicate
+per channel). CONCLUSIONS: (a) large-message story is now Bine>PAT at 64n given
+channel tuning (auto-tuning would need the tuning.cc model updated — known Phase 5
+item); (b) small/mid remains THE gap and is unaffected by channels -> Phase 4
+butterfly hybrid is the next code change; (c) optional: ch=4/8 sweep to map the
+crossover; 128-node point still pending.
