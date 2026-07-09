@@ -67,10 +67,15 @@ everything: `PatAGAlgorithm<T>` in `src/include/collectives.h` (~line 697).
 
 ```
 cd bench_bine
-python3 verify_schedule.py baseline   # current code: static OK, fifo DEADLOCK at n>=64 (the bug)
+python3 verify_schedule.py baseline   # pre-fix depth order: static OK, fifo DEADLOCK at n>=64 (the bug)
 python3 verify_schedule.py phase2     # gate for Phase 2 (must print RESULT: PASS)
 python3 verify_schedule.py phase4     # gate for Phase 4 (must print RESULT: PASS)
+python3 timed_sim.py                  # throughput model: candidate emission orders side by side
 ```
+
+`timed_sim.py` exists because liveness is necessary but NOT sufficient: plain
+source order passes every liveness gate yet measured ~0.1x PAT on hardware.
+Any emission-order change must look sane in the timed model too.
 
 The Python classes mirror the C++. **Whenever you edit the C++ schedule, make
 the identical edit to the mirror class and re-run.** If in doubt, print both
@@ -105,69 +110,71 @@ clean form.
 
 ---
 
-## Phase 2 — deadlock fix: source-order emission (+ delete `depthOf`)
+## Phase 2 — deadlock fix: SKEWED source-order emission (+ delete `depthOf`)
 
-**Why**: the current emission groups ops by tree depth. Simulation shows this
-deadlocks with 8-slot FIFOs at `n ≥ 64` (dim-0 partners stall symmetrically:
-dim 0 carries `n/2` blocks per chunk and the send position runs > 8 steps
-ahead of the partner's matching recv). Emitting ops in **global source order**
-(`s = 0..n-1`) keeps every connection's send/recv positions aligned and is
-deadlock-free even at FIFO depth 2 for all po2 `n ≤ 256` (verified). Bonus:
-the depth values become unnecessary, deleting the O(n²·log n) `depthOf` pass
-(~230k `binePi` calls per channel per call at n=256 → ~500).
+> **Amended 2026-07-09 after a 64-node Leonardo run.** The first version of
+> this phase prescribed plain source order (`s = 0..n-1`). It is deadlock-free
+> (0 #wrong, no hang at 64 nodes — the liveness fix worked) but measured
+> **~0.1x PAT at every size** (~1 GB/s plateau): every rank consumes each
+> block at the same wavefront instant its parent produces it, so every fused
+> op stalls one full network hop, serialized. Liveness gates alone are NOT
+> sufficient for an emission order — it must also pass the throughput model
+> in `bench_bine/timed_sim.py`.
 
-**Edits in `src/include/collectives.h`, `PatAGAlgorithm`:**
+**Why**: the original emission groups ops by tree depth. Simulation shows this
+deadlocks with 8-slot FIFOs at `n ≥ 64`: its per-connection bursts equal
+binomial(log2(n)−1, d) — ≤6 at n=32 but 10 at n=64 — so dim-0 partners stall
+symmetrically mid-depth-group. Plain source order is live but slow (above).
+The fix is the one-parameter family between them: emit blocks in ascending
 
-1. Delete `depthOf()` entirely (and its `tmp[260]` array); delete the
-   `dof[260]` array, the `dof`/`maxDepth` computation, and the
-   `for (int d = 0; d <= maxDepth; d++)` emission loop.
-2. Replace the emission with (same inner logic, new outer order):
-   ```cpp
-   nOps = 0;
-   for (int s = 0; s < nranks; s++) {
-     if (s == rank) {
-       push(0, -1, -1, rank);                          // INIT own block
-       for (int k = 0; k < nsteps; k++)
-         if (cmask[s] & (1u << k)) push(1, -1, k, s);  // own-block forwards
-     } else {
-       int first = -1;
-       for (int k = 0; k < nsteps; k++)
-         if (cmask[s] & (1u << k)) { first = k; break; }
-       if (first >= 0) {
-         push(3, krecv[s], first, s);                  // FUSED recv+forward
-         for (int k = first + 1; k < nsteps; k++)
-           if (cmask[s] & (1u << k)) push(1, -1, k, s); // extra forwards
-       } else {
-         push(2, krecv[s], -1, s);                     // leaf recv
-       }
-     }
-   }
-   ```
-3. Make `push()` overflow loud instead of silent:
-   ```cpp
-   if (nOps >= RMAXOPS) {
-   #ifdef __CUDA_ARCH__
-     __trap();
-   #else
-     abort();
-   #endif
-   }
-   ```
-4. Update the class comment: remove the "scheduled by TREE DEPTH" paragraph;
-   document that ops are emitted in global source order because it bounds the
-   per-connection send/recv skew (deadlock-free at FIFO depth 2, verified by
-   `bench_bine/verify_schedule.py phase2`), and that INIT is no longer op 0
-   (it sits at position ≈ rank — nothing depends on it being first except the
-   own-block forwards, which still immediately follow it).
-5. Mirror the same change in `verify_schedule.py` is NOT needed — the
-   `RelaySrcOrder` class already implements exactly this target.
+```
+key(s) = s + λ · depth(s)        (ties by s;  λ = BINE_SKEW_LAMBDA = 6)
+```
+
+where `depth(s)` is this rank's depth in block s's broadcast tree (recorded
+for free during the `getIdx` DFS — the separate O(n²·log n) `depthOf` pass,
+~230k `binePi` calls per channel per call at n=256, is deleted). λ places a
+block's ops ~λ positions later per tree-hop, so data arrives ~one hop before
+it is consumed (throughput ≈ depth order's) while per-connection send/recv
+skew stays bounded (liveness). Per-connection order consistency holds for ANY
+λ: the receiver's depth is the sender's +1, so its keys are the sender's
+shifted by exactly +λ — same relative order at both endpoints.
+
+λ chosen by simulation: λ=6 is live down to FIFO depth 6 (two slots of margin
+below the real 8) for all po2 n ≤ 256 and within ~5% of the model's best
+throughput; λ=8 has zero margin; λ≥12 deadlocks at n≥64; λ=0 is the measured
+10x regression.
+
+**Edits in `src/include/collectives.h`, `PatAGAlgorithm`** (IMPLEMENTED):
+
+1. Delete `depthOf()` and `inArr()` entirely. Instead, extend `getIdx()` with
+   an optional `int* dep` output: `dep[i]` = DFS depth of `out[i]` below the
+   subtree root (`e0` has depth 1). When called with `start == rank`, this is
+   exactly rank's depth in `out[i]`'s broadcast tree, so the krecv pass fills
+   `dof[s]` for free.
+2. Emit blocks by an O(n²) min-key selection scan over
+   `key(x) = x + BINE_SKEW_LAMBDA * dof[x]` (strict `<`, so ties resolve to
+   the smaller block id — this must match the mirror's stable
+   `sorted(..., key=(key, s))`). Per-block inner logic unchanged: INIT +
+   own-block forwards for `s == rank`; FUSED + extra forwards, or leaf recv,
+   otherwise.
+3. `push()` overflow is loud (`__trap()` on device, `abort()` on host), and
+   `#include <stdlib.h>` was added for the host path.
+4. `BINE_SKEW_LAMBDA` (=6) is a `#define` above the class; it MUST stay in
+   lockstep with `BINE_SKEW_LAMBDA` in `verify_schedule.py`.
 
 **Notes**: `getNextOp`, `patCopy`, `proxy.cc`, `generic.cc`, and the tuning
 guard need NO changes in this phase. The op multiset is unchanged (verified by
 the harness), so per-dim step counts and hence proxy behavior are identical.
 
-**Gate**: `python3 verify_schedule.py phase2` → `RESULT: PASS`, and the C++
-emission is line-for-line the same logic as `RelaySrcOrder.emit_block_ops`.
+**Gate** (all three, after ANY change to the emission):
+1. `python3 verify_schedule.py phase2` → `RESULT: PASS` (static invariants +
+   FIFO liveness at depth 8 and at depth 6 — the margin — for 1 and 3 chunks).
+2. `python3 timed_sim.py` → the shipped order must be within ~2x of the best
+   LIVE candidate at every n (this is the gate plain source order failed).
+3. Byte-compare the real C++ op lists against the mirror (standalone host
+   compile of the constructor logic; `proxy.cc` proves the header compiles on
+   host) for all po2 n ≤ 256, all ranks.
 
 ---
 
@@ -308,10 +315,17 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
    grows ~n/8 (needs 64 slots at n=256), and it doubles buffer memory
    globally. The emission order is the correct fix.
 3. **Do not enable `parallelFactor > 1` casually** — see Phase 4b races.
-4. **Do not reorder ops** (any mode) without re-running `verify_schedule.py`
-   — including the depth-2 margin runs — and updating the mirror class.
+4. **Do not reorder ops** (any mode) without re-running BOTH
+   `verify_schedule.py` (liveness, incl. the depth-6 margin runs) AND
+   `timed_sim.py` (throughput) and updating the mirror class. A live order
+   can still be 10x slow — see #6.
 5. **Do not compare against the old results.md numbers** — they were measured
    with device printfs in the hot path.
+6. **Do not use plain source order (λ=0)** — deadlock-free but MEASURED
+   ~0.1x PAT at 64 nodes on Leonardo (2026-07-09): consumption is synchronous
+   with production, so every fused op eats a serialized network hop. And do
+   not raise `BINE_SKEW_LAMBDA` past 8: λ=8 already has zero FIFO-depth
+   margin, λ≥12 deadlocks at n≥64.
 
 ## Acceptance criteria (project done when all hold)
 

@@ -740,23 +740,37 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // k -> connection peer binePi(rank,k) (generic.cc connects these; send-peer == recv-peer
 // per dim).
 //
-// EMISSION ORDER = GLOBAL SOURCE ORDER (s = 0..nranks-1): a rank emits all of its ops for
-// block 0, then block 1, ... This is NOT for locality -- it is what makes the schedule
-// deadlock-free under NCCL's bounded (NCCL_STEPS-slot) FIFOs. On any connection r<->p the
-// block r sends and the block p receives both advance with the global index s, so the
-// sender never runs more than O(1) ops ahead of the partner's matching receive; the
-// pipeline fills across depths via the FIFO slack. (An earlier depth-ordered emission put
-// a full binomially-large depth-group of dim-0 sends ahead of the partner's matching
-// recvs, overflowing the 8-slot FIFO and deadlocking at nranks >= 64. Verified in
-// bench_bine/verify_schedule.py: source order is safe down to FIFO depth 2 for all po2
-// nranks <= 256; depth order deadlocks at n>=64.) INIT is no longer op 0 -- it sits at
-// s == rank -- but its own-block forwards still immediately follow it, and every SEND-only
-// op still comes after the op that gathered its block.
+// EMISSION ORDER = SKEWED SOURCE ORDER: blocks are emitted in ascending
+// key(s) = s + BINE_SKEW_LAMBDA * depth(s), ties by s, where depth(s) is this rank's
+// depth in block s's broadcast tree. This one-parameter family interpolates between two
+// orders that both fail:
+//   lambda = 0 (plain source order): deadlock-free but SLOW -- every rank consumes each
+//     block at the same wavefront instant its parent produces it, so every fused op
+//     stalls a full network hop, serialized (measured 0.1x PAT at 64 nodes on Leonardo).
+//   lambda = inf (depth order): pipelines beautifully (blocks are consumed in arrival
+//     order) but its per-connection bursts equal binomial(log2(n)-1, d), which exceeds
+//     the NCCL_STEPS=8 FIFO depth at nranks >= 64 -> mutual dim-0 deadlock.
+// Intermediate lambda emits a block's ops ~lambda positions later per tree-hop, so data
+// arrives ~one hop before it is consumed (throughput) while per-connection send/recv
+// skew stays bounded (liveness). Per-connection order consistency is preserved for ANY
+// lambda: on the connection r->p the receiver's depth is the sender's +1, so p's keys
+// are r's shifted by exactly +lambda -- same relative order on both endpoints.
+// lambda = 6 was chosen with the timed + liveness simulators (bench_bine/timed_sim.py,
+// bench_bine/verify_schedule.py): it is deadlock-free down to FIFO depth 6 (two slots of
+// margin below the real 8) for all po2 nranks <= 256, and within ~5% of the best
+// throughput in the model; lambda >= 12 deadlocks at n >= 64, lambda = 8 has zero
+// margin. INIT is emitted at key == rank (depth 0); its own-block forwards immediately
+// follow it, and every SEND-only op still comes after the op that gathered its block.
 //
 // The op list (kind/rdim/sdim/src) depends only on rank/nranks -> identical on
 // host(proxy, T=char) and device(kernel, T); byte offsets scale by sizeof(T). Built once
 // at construction (a single O(n log n) pass over the negabinary trees on the compute
 // thread), replayed per chunk. Sized for po2 nRanks <= 256 (tuning.cc restricts use).
+// Emission-order skew (list positions per tree-hop). MUST stay in lockstep with the
+// mirror in bench_bine/verify_schedule.py; changing it requires re-running the phase2
+// gate there (liveness) and bench_bine/timed_sim.py (throughput model).
+#define BINE_SKEW_LAMBDA 6
+
 template <typename T>
 class PatAGAlgorithm {
   static const int RMAXOPS = 520; // >= ~1.5*nRanks for nRanks <= 256
@@ -781,16 +795,22 @@ class PatAGAlgorithm {
   __device__ __host__ int getNelem() { return (int)imin(chunkCount, end - offset); }
 
   // Enumerate get_indexes(start,st) in DFS pre-order into out[]; returns count.
-  __device__ __host__ int getIdx(int start, int st, int* out) {
+  // If dep != nullptr, dep[i] = tree depth of out[i] below 'start' (e0 has depth 1);
+  // when start == rank this is exactly rank's depth in out[i]'s broadcast tree.
+  __device__ __host__ int getIdx(int start, int st, int* out, int* dep = nullptr) {
     if (st >= nsteps) return 0;
-    int e0 = binePi(start, st, nranks); int no = 0; out[no++] = e0;
-    int node[32], sval[32], top = 0; node[0] = e0; sval[0] = st + 1; top = 1;
+    int e0 = binePi(start, st, nranks); int no = 0;
+    if (dep) dep[no] = 1;
+    out[no++] = e0;
+    int node[32], sval[32], dstk[32], top = 0;
+    node[0] = e0; sval[0] = st + 1; dstk[0] = 1; top = 1;
     while (top > 0) {
-      int y = node[top - 1], s = sval[top - 1];
+      int y = node[top - 1], s = sval[top - 1], d = dstk[top - 1];
       if (s >= nsteps) { top--; continue; }
       sval[top - 1] = s + 1;
       int c = binePi(y, s, nranks);
-      out[no++] = c; node[top] = c; sval[top] = s + 1; top++;
+      if (dep) dep[no] = d + 1;
+      out[no++] = c; node[top] = c; sval[top] = s + 1; dstk[top] = d + 1; top++;
     }
     return no;
   }
@@ -816,20 +836,33 @@ public:
     nsteps = log2Up(nranks);
     nelem = getNelem();
     // Precompute per source block s: krecv[s] = the dim r receives s on (-1 if s==r),
-    // cmask[s] = bitmask of child dims r forwards s to. Both come from the negabinary
-    // trees: getIdx(rank,k) is the set r receives via dim k; getIdx(binePi(rank,k),k) is
-    // the set r forwards to its child on dim k.
-    signed char krecv[260]; unsigned char cmask[260];
-    for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; }
-    int set[260];
+    // dof[s] = r's depth in s's broadcast tree (free from the same DFS), and
+    // cmask[s] = bitmask of child dims r forwards s to. All from the negabinary trees:
+    // getIdx(rank,k) is the set r receives via dim k; getIdx(binePi(rank,k),k) is the
+    // set r forwards to its child on dim k.
+    signed char krecv[260]; unsigned char cmask[260]; short dof[260];
+    for (int s = 0; s < nranks; s++) { krecv[s] = -1; cmask[s] = 0; dof[s] = 0; }
+    int set[260], dep[260];
     for (int k = 0; k < nsteps; k++) {
-      int c = getIdx(rank, k, set);                for (int i = 0; i < c; i++) krecv[set[i]] = (signed char)k; // r receives set[i] via dim k
-      c = getIdx(binePi(rank, k, nranks), k, set); for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);     // r forwards set[i] to child dim k
+      int c = getIdx(rank, k, set, dep);
+      for (int i = 0; i < c; i++) { krecv[set[i]] = (signed char)k; dof[set[i]] = (short)dep[i]; } // r receives set[i] via dim k
+      c = getIdx(binePi(rank, k, nranks), k, set);
+      for (int i = 0; i < c; i++) cmask[set[i]] |= (1u << k);                                      // r forwards set[i] to child dim k
     }
-    // Emit ops in GLOBAL SOURCE ORDER (see class comment): all ops for block s, for
-    // s = 0..nranks-1. Deadlock-free under bounded FIFOs (verify_schedule.py).
+    // Emit blocks in SKEWED SOURCE ORDER (see class comment): ascending
+    // key(s) = s + BINE_SKEW_LAMBDA*dof[s], ties broken by smaller s.
+    // O(n^2) selection scan; trivial next to the data movement.
     nOps = 0;
-    for (int s = 0; s < nranks; s++) {
+    unsigned char emitted[260];
+    for (int s = 0; s < nranks; s++) emitted[s] = 0;
+    for (int e = 0; e < nranks; e++) {
+      int s = -1, bestKey = 0x7fffffff;
+      for (int x = 0; x < nranks; x++) {
+        if (emitted[x]) continue;
+        int key = x + BINE_SKEW_LAMBDA * (int)dof[x];
+        if (key < bestKey) { bestKey = key; s = x; }     // strict '<': equal keys resolve to smaller x
+      }
+      emitted[s] = 1;
       if (s == rank) {
         push(0, -1, -1, rank);                 // INIT: own block input -> output
         for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // forward own block to every child

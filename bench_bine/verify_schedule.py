@@ -30,7 +30,8 @@ Usage:
   python3 verify_schedule.py baseline   # mirror of the ORIGINAL depth-order
                                         # emission: static passes, FIFO sim is
                                         # EXPECTED to deadlock at n>=64
-  python3 verify_schedule.py phase2     # source-order relay: ALL gates must pass
+  python3 verify_schedule.py phase2     # skewed source-order relay (the code
+                                        # in collectives.h): ALL gates must pass
   python3 verify_schedule.py phase4     # butterfly mode: ALL gates must pass
   python3 verify_schedule.py all        # run everything
 Exit code 0 = all required gates passed.
@@ -206,13 +207,53 @@ class RelayDepthOrder(RelayBase):
 
 
 class RelaySrcOrder(RelayBase):
-    """Phase-2 target: emit blocks in GLOBAL SOURCE ORDER s = 0..n-1.
-    Same op multiset as depth order; per-connection sequences stay ascending
-    on both endpoints; FIFO-safe at depth 2 for all po2 n <= 256 (verified)."""
+    """Plain source order s = 0..n-1 (lambda=0). Deadlock-free at FIFO depth 2
+    BUT measured ~0.1x PAT at 64 nodes on Leonardo: every rank consumes each
+    block at the same wavefront instant its parent produces it, so every fused
+    op stalls one full network hop, serialized. Kept as a reference; DO NOT
+    ship. The shipping order is RelaySkewOrder below."""
 
     def __init__(self, *a):
         super().__init__(*a)
         for s in range(self.nranks):
+            self.ops.extend(self.emit_block_ops(s))
+
+
+BINE_SKEW_LAMBDA = 6  # must match src/include/collectives.h
+
+
+class RelaySkewOrder(RelayBase):
+    """Phase-2 target (mirror of the C++): emit blocks in ascending
+    key(s) = s + lam*depth(s), ties by s, where depth(s) is this rank's depth
+    in block s's broadcast tree (recorded during the getIdx DFS -- equals the
+    old depthOf()). lam interpolates source order (lam=0, live but slow) and
+    depth order (lam=inf, fast but deadlocks at n>=64). Per-connection order
+    consistency holds for any lam because the receiver's depth is the
+    sender's +1, shifting all keys by the same +lam. lam=6: deadlock-free
+    down to FIFO depth 6 for all po2 n <= 256 (2 slots of margin), and near
+    the throughput optimum of the timed model (timed_sim.py)."""
+
+    def __init__(self, offset, end, count, chunkCount, rank, nranks,
+                 lam=BINE_SKEW_LAMBDA):
+        super().__init__(offset, end, count, chunkCount, rank, nranks)
+        n = nranks
+        self.dof = dof = [0] * n
+        for k in range(self.nsteps):
+            e0 = binePi(rank, k, n)
+            dof[e0] = 1
+            node = [e0]; sval = [k + 1]; dstk = [1]
+            while node:
+                y = node[-1]; s_ = sval[-1]; d = dstk[-1]
+                if s_ >= self.nsteps:
+                    node.pop(); sval.pop(); dstk.pop(); continue
+                sval[-1] = s_ + 1
+                c = binePi(y, s_, n)
+                dof[c] = d + 1
+                node.append(c); sval.append(s_ + 1); dstk.append(d + 1)
+        # equivalent to the C++ O(n^2) min-key selection scan (strict '<',
+        # first smallest s wins ties)
+        order = sorted(range(n), key=lambda s: (s + lam * dof[s], s))
+        for s in order:
             self.ops.extend(self.emit_block_ops(s))
 
 
@@ -436,23 +477,24 @@ def run_baseline():
 
 
 def run_phase2():
-    print("== phase2 (source-order relay) - ALL gates must pass ==")
+    print(f"== phase2 (skewed source-order relay, lambda={BINE_SKEW_LAMBDA}) - ALL gates must pass ==")
     ok = True
     for n in SIZES:
-        e = static_checks(n, RelaySrcOrder)
+        e = static_checks(n, RelaySkewOrder)
         # multiset equality with depth-order (same work, different order)
         for r in range(n):
-            if sorted(RelaySrcOrder(0, 1, 1, 1, r, n).ops) != \
+            if sorted(RelaySkewOrder(0, 1, 1, 1, r, n).ops) != \
                sorted(RelayDepthOrder(0, 1, 1, 1, r, n).ops):
                 e.append(f"n={n} r={r}: op multiset differs from depth-order")
                 break
-        res = [fifo_sim(n, RelaySrcOrder, nchunks=c, depth=d)
-               for c in (1, 3) for d in (8, 2)]
-        cerrs = chunk_checks(n, RelaySrcOrder)
+        # depth 8 = real FIFO; depth 6 = required liveness margin
+        res = [fifo_sim(n, RelaySkewOrder, nchunks=c, depth=d)
+               for c in (1, 3) for d in (8, 6)]
+        cerrs = chunk_checks(n, RelaySkewOrder)
         good = not e and all(x == 'OK' for x in res) and not cerrs
         ok &= good
         print(f"n={n:4d}: static {'OK' if not e else 'FAIL'}  "
-              f"fifo(d8/d2 x c1/c3): {res}  chunks {'OK' if not cerrs else 'FAIL'}"
+              f"fifo(d8/d6 x c1/c3): {res}  chunks {'OK' if not cerrs else 'FAIL'}"
               + ('' if good else '   <<< FAIL'))
     return ok
 
