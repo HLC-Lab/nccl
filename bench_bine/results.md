@@ -653,3 +653,43 @@ it per-node-count is a losing game -- the real small/mid lever is Phase 4b (para
 >1). (3) avg 0.88x (vs 0.98 at 64n): Bine relatively weaker at 128n, dragged by small/mid.
 CAVEAT: 1 rep; 33M 1.40 / 67M 0.56 are adjacent opposite spikes = noise; re-run 3 reps for
 any quoted small/mid number. Large (>=128M) is trustworthy.
+
+## 2026-07-10 — 128 NODES, 3-REP CONFIRMATION (16ch + 8ch) + butterfly envelope
+
+Same allocation, N=128 (1 GPU/node), -n 50, 0 #wrong everywhere, no hangs.
+NOTE on the default XOVER in these runs: binary default matters only where the postFreq
+safety floor allows the butterfly at all; at 128n (minPost=8, slot 512KB) that region ends
+far below where the 64KB-vs-128KB defaults differ, so these numbers are identical either way.
+
+### 16ch, 3 reps (default XOVER):
+
+| size    | Ring |  PAT | Bine | Bine/PAT |
+|---------|-----:|-----:|-----:|---------:|
+| 1 MB    | 0.33 | 1.01 | 0.62 |   0.61   |
+| 4 MB    | 1.26 | 3.84 | 1.74 |   0.45   |
+| 16 MB   | 1.93 | 3.89 | 3.79 |   0.97   |
+| 33 MB   | 4.27 | 5.13 | 4.63 |   0.90   |
+| 67 MB   | 5.58 | 6.99 | 4.84 |   0.69   |
+| 128 MB  | 4.81 | 6.96 | 6.75 |   0.97   |
+| 256 MB  | 6.99 | 6.87 | 7.71 |   1.12   |  <- Bine wins (3-rep)
+| 512 MB  | 8.90 | 6.97 | 7.87 |   1.13   |  <- Bine wins
+| 1 GB    |10.09 | 7.03 | 8.04 |   1.14   |  <- Bine wins
+| **avg** | 1.67 | 2.01 | 1.78 |   0.89   |
+
+### 8ch, 3 reps (default XOVER): large win thinner but present
+
+67 MB 1.05 / 256 MB 1.03 / 512 MB 1.11 / 1 GB 1.05; small/mid 0.25-0.79; avg 0.88.
+(Same pattern as 64n: more channels -> bigger Bine edge at large.)
+
+### 16ch, XOVER=2e8 ("butterfly wherever safe"), 1 rep:
+
+Small/mid STILL 0.17-0.59 -- maxing the butterfly region does NOT fix small at 128n
+(and at large the postFreq floor forces relay anyway: 512 MB 1.19, 1 GB 1.16, same as
+default). Confirms with data: no XOVER value helps <=8 MB at 128 nodes.
+
+BOTTOM LINE 128n (3-rep): Bine BEATS PAT >=256 MB at 16ch (1.12-1.14x) and >=512 MB at 8ch
+(1.05-1.11x); ~parity 16-128 MB except a persistent 67 MB dip (0.69); LOSES <=8 MB
+(0.25-0.66) at every XOVER -- the butterfly's 64n small/mid wins do not survive at 128n
+(7 rounds, smaller blocks). avg ~0.89 both channel counts. CONCLUSION: threshold tuning is
+EXHAUSTED as a lever; the small/mid gap at scale is parallelFactor=1 (Phase 4b) territory,
+plus the 33-67 MB relay ramp (sub-chunking/pipeline-fill).
