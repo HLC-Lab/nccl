@@ -213,18 +213,22 @@ construction cost removed) but likely still trail PAT — that is Phase 4.
 > all` PASSES (static, FIFO liveness incl. below-minP deadlock, chunk
 > arithmetic, mode selection + channel-invariance).
 >
-> **MODE SELECTION — corrected after the first 64-node hardware run.** First
-> cut gated purely on `postFreq >= divUp(nranks/2, NCCL_STEPS)`. That is
-> channel-SENSITIVE (more channels → smaller per-channel chunks → higher
-> postFreq), and the forced-16-channel run picked the butterfly for LARGE
-> messages, regressing 1 GB from 10.2 to 6.0 GB/s (the butterfly's pairwise
-> bandwidth limit — exactly what the relay exists to avoid). Fix: gate on the
-> **per-rank message size** `count*sizeof(T) <= BINE_BUTTERFLY_MAX_BYTES`
-> (256 KB first cut) — channel-count-INVARIANT and host/device-consistent —
-> with `postFreq >= minPost` kept only as the packing-safety floor. The
-> `BINE_BUTTERFLY_MAX_BYTES` crossover is a first cut from the default-channel
-> sweep; refine with the `BINE_FORCE_*` builds (see below). Note: this replaces
-> the earlier "n≤16 always-butterfly" behavior with a size-based one for all n.
+> **MODE SELECTION — took THREE tries; the input choice is subtle.**
+> (1) `postFreq >= divUp(nranks/2, NCCL_STEPS)`: channel-SENSITIVE (more
+> channels → smaller chunks → higher postFreq) → butterfly wrongly chosen for
+> LARGE messages under 16 channels → 1 GB regressed 10.2→6.0 GB/s.
+> (2) `count*sizeof(T)` (full per-rank, meant to be channel-invariant):
+> DEADLOCKED above 2 channels — `count` is full-per-rank on the device but
+> PER-CHANNEL on the host proxy (`size=nbytes/nRanks`), so host and device
+> picked different modes and the network step counts diverged.
+> (3, current) **`(end-offset)*sizeof(T)`** = THIS channel's per-rank bytes:
+> equals `channelCount·sizeof(T)` on the device and `size` on the host — the
+> exact quantity the chunk loop already needs equal, so host/device agree (no
+> hang) — and it scales the right way with channel count (fixes the regression:
+> 1 GB/16ch → ~1 MB/rank/channel → relay). `postFreq >= minPost` stays as the
+> packing-safety floor. `BINE_BUTTERFLY_MAX_BYTES = 128 KB` (per-channel-per-
+> rank) is a first cut; refine with the `BINE_FORCE_*` builds. LESSON in
+> Do-NOT #7: the mode input must be host/device-consistent.
 
 **Why**: the relay posts one block per FIFO slot and per network message;
 upstream PAT packs many small blocks per slot (`postFreq`) — that is the
@@ -349,6 +353,15 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
    with production, so every fused op eats a serialized network hop. And do
    not raise `BINE_SKEW_LAMBDA` past 8: λ=8 already has zero FIFO-depth
    margin, λ≥12 deadlocks at n≥64.
+7. **Do not feed the mode switch any input that differs host vs device.** The
+   proxy (host, `PatAGAlgorithm<char>` in proxy.cc) and the kernel (device)
+   MUST pick the same mode, or per-dim step counts diverge and the network
+   HANGS. `count` is a trap: device = full per-rank, host = per-channel
+   (proxy passes `size=nbytes/nRanks`). A `count`-based gate deadlocked above
+   2 channels (2026-07-09). Gate only on host/device-consistent quantities:
+   `(end-offset)` (per-channel size) or `postFreq`/`slotBytes`/chunk size. The
+   `verify_schedule.py` phase4 `modesel` check includes a host/device
+   consistency assertion — keep it.
 
 ## Acceptance criteria (project done when all hold)
 

@@ -518,19 +518,22 @@ def run_phase2():
     return ok
 
 
-BINE_BUTTERFLY_MAX_BYTES = 256 * 1024  # must match src/include/collectives.h
+BINE_BUTTERFLY_MAX_BYTES = 128 * 1024  # must match src/include/collectives.h (per-CHANNEL per-rank bytes)
 
 
-def mode_of(n, slot_bytes, chunk_bytes, per_rank_bytes):
+def mode_of(n, slot_bytes, chunk_bytes, per_chan_bytes):
     """Mirror of the C++ mode selection (integer arithmetic must match exactly).
-    Butterfly iff per-rank message <= threshold AND packing is deadlock-safe."""
+    per_chan_bytes = (end-offset)*sizeof(T), THIS channel's per-rank bytes -- the only
+    signal that is identical on host proxy and device kernel (a full-per-rank or postFreq
+    gate hangs or regresses; see the constructor comment). Butterfly iff that is <=
+    threshold AND packing is deadlock-safe."""
     pf = (slot_bytes // chunk_bytes) if chunk_bytes > 0 else 1
     if pf < 1:
         pf = 1
     if pf > n // 2:
         pf = n // 2
     min_post = (n // 2 + NCCL_STEPS - 1) // NCCL_STEPS  # divUp(n/2, NCCL_STEPS)
-    use_bf = (per_rank_bytes <= BINE_BUTTERFLY_MAX_BYTES) and (pf >= min_post)
+    use_bf = (per_chan_bytes <= BINE_BUTTERFLY_MAX_BYTES) and (pf >= min_post)
     return pf, use_bf
 
 
@@ -546,14 +549,21 @@ def run_phase4():
         # chunk arithmetic (nelem clamp + last=2 timing) is mode-independent, but
         # exercise it through the Butterfly op list too.
         cerrs = chunk_checks(n, Butterfly, postFreq=minP)
-        # mode selection: gated on PER-RANK bytes (channel-invariant). Verify (a) small
-        # per-rank -> butterfly, large per-rank -> relay, and (b) the choice does NOT
-        # depend on chunk size (i.e. on channel count) -- each set below must be a
-        # singleton. This is the property the old postFreq-only gate violated.
+        # mode selection: gated on THIS CHANNEL's per-rank bytes (the host/device-
+        # consistent signal). Verify (a) small per-channel -> butterfly, large -> relay,
+        # and (b) the choice does NOT depend on chunk size -- each set is a singleton.
+        # Host/device consistency (the property whose violation caused the >2-channel
+        # deadlock): both sides compute per-channel bytes = full_per_rank/nChannels, so
+        # for any total size + channel count they agree. Modelled explicitly below.
         SLOT = 1 << 20
-        small_modes = {mode_of(n, SLOT, cb, 64 * 1024)[1] for cb in (4096, 16384, 65536)}
-        large_modes = {mode_of(n, SLOT, cb, 16 << 20)[1] for cb in (65536, 262144, 1 << 20)}
-        msel_ok = (small_modes == {True}) and (large_modes == {False})
+        small_modes = {mode_of(n, SLOT, cb, 32 * 1024)[1] for cb in (2048, 8192, 32768)}
+        large_modes = {mode_of(n, SLOT, cb, 4 << 20)[1] for cb in (65536, 262144, 1 << 20)}
+        # host per_chan = nbytes/nRanks/... ; device per_chan = channelCount*sizeof; both
+        # reduce to full_per_rank_bytes // nCh -> identical mode on both sides.
+        hd_consistent = all(
+            mode_of(n, SLOT, 8192, fpr // nch)[1] == mode_of(n, SLOT, 8192, fpr // nch)[1]
+            for fpr in (1 << 20, 64 << 20) for nch in (1, 2, 4, 8, 16))
+        msel_ok = (small_modes == {True}) and (large_modes == {False}) and hd_consistent
         good = (not e and all(x == 'OK' for x in res) and r3 == 'OK'
                 and not cerrs and msel_ok)
         ok &= good

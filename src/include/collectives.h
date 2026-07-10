@@ -739,10 +739,11 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 //   BUTTERFLY (small/mid messages): pico's allgather_bine_block_by_block -- log2(n) rounds
 //     of pairwise exchange with partner binePi(rank,t), packing postFreq blocks into each
 //     FIFO slot so one network post covers many blocks. Latency-optimal where the relay's
-//     one-post-per-block cost dominates. Selected when the PER-RANK message size
-//     (count*sizeof(T), channel-count-invariant) <= BINE_BUTTERFLY_MAX_BYTES, provided a
-//     slot can hold enough of the largest round to be deadlock-free (postFreq >=
-//     divUp(nranks/2, NCCL_STEPS)); otherwise the relay runs.
+//     one-post-per-block cost dominates. Selected when THIS CHANNEL's per-rank bytes
+//     ((end-offset)*sizeof(T)) <= BINE_BUTTERFLY_MAX_BYTES, provided a slot can hold
+//     enough of the largest round to be deadlock-free (postFreq >= divUp(nranks/2,
+//     NCCL_STEPS)); otherwise the relay runs. The per-channel gate is required for
+//     host(proxy)/device(kernel) mode agreement -- see the constructor.
 //
 // Op kinds (both modes): INIT (own block input->output), FUSED (recv+forward, relay only),
 // SEND-only (forward a held block, reads output), RECV-only (leaf/plain receive). Each op
@@ -785,12 +786,14 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // gate there (liveness) and bench_bine/timed_sim.py (throughput model).
 #define BINE_SKEW_LAMBDA 6
 
-// Butterfly (packed pairwise) is used when the PER-RANK message is at or below this many
-// bytes; above it the multi-peer relay wins. Channel-count-invariant (see mode selection
-// in the constructor). First-cut crossover from the 64-node default-channel sweep; refine
-// with the BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds. Keep in lockstep with the
-// mirror in bench_bine/verify_schedule.py.
-#define BINE_BUTTERFLY_MAX_BYTES (256 * 1024)
+// Butterfly (packed pairwise) is used when THIS CHANNEL's per-rank byte count
+// ((end-offset)*sizeof(T)) is at or below this threshold; above it the multi-peer relay
+// wins. Gated on the per-channel figure because that is the only size signal that is
+// consistent between the host proxy and the device kernel (see mode selection in the
+// constructor); a full-per-rank or postFreq gate either hangs or regresses. First-cut
+// crossover; refine with the BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds. Keep in
+// lockstep with the mirror in bench_bine/verify_schedule.py.
+#define BINE_BUTTERFLY_MAX_BYTES (128 * 1024)
 
 template <typename T>
 class PatAGAlgorithm {
@@ -878,23 +881,34 @@ public:
     if (postFreq < 1) postFreq = 1;
     if (postFreq > nranks / 2) postFreq = nranks / 2;
     int minPost = (nranks / 2 + NCCL_STEPS - 1) / NCCL_STEPS; // divUp(nranks/2, NCCL_STEPS)
-    // Mode selection. The butterfly (packed pairwise, few network posts) wins the
-    // small/mid latency-bound regime; the skewed relay (multi-peer width) wins large.
-    // GATE ON PER-RANK MESSAGE SIZE, not on postFreq: count*sizeof(T) is the per-rank
-    // byte count -- identical on host (T=char) and device, and INDEPENDENT of channel
-    // count. An earlier postFreq-only gate was channel-SENSITIVE (more channels ->
-    // smaller chunks -> higher postFreq) and wrongly picked the butterfly for large
-    // messages under many channels: measured 1 GB regression 10.2 -> 6.0 GB/s at 16
-    // channels (64 nodes, Leonardo). postFreq >= minPost stays as the packing-safety
-    // floor (below it the butterfly deadlocks). BINE_BUTTERFLY_MAX_BYTES is a first-cut
-    // crossover from the default-channel sweep; refine with the BINE_FORCE_* builds.
-    size_t perRankBytes = count * sizeof(T);
+    // Mode selection. Butterfly (packed pairwise, few posts) wins the small/mid
+    // latency-bound regime; the skewed relay (multi-peer width) wins large.
+    //
+    // GATE ON THIS CHANNEL'S PER-RANK BYTES = (end-offset)*sizeof(T). This quantity is
+    // the ONLY size signal that is BOTH (a) host/device CONSISTENT and (b) a sensible
+    // regime indicator. It must be host/device consistent or the proxy (host) and kernel
+    // (device) pick different modes -> different op lists -> different per-dim step
+    // counts -> NETWORK HANG. Two traps learned the hard way:
+    //   * postFreq alone (= slotBytes/chunkBytes): consistent, but channel-SENSITIVE
+    //     (more channels shrink the chunk, raise postFreq) -> butterfly wrongly chosen
+    //     for large messages under many channels -> 1 GB 10.2->6.0 GB/s at 16 channels.
+    //   * count*sizeof(T) (full per-rank): channel-invariant, but 'count' is the FULL
+    //     per-rank size on the device and the PER-CHANNEL size on the host proxy
+    //     (proxy.cc passes size=nbytes/nRanks as count) -> the two sides disagree above
+    //     2 channels -> DEADLOCK.
+    // (end-offset) sidesteps both: on the device it is channelCount, on the host it is
+    // 'size'; the chunk loop already relies on these being equal, so the mode decision
+    // inherits that guarantee. It scales down with channel count in the RIGHT direction
+    // (less data per channel -> more latency-bound -> butterfly). postFreq >= minPost is
+    // kept as the packing-safety floor (below it the butterfly deadlocks).
+    // BINE_BUTTERFLY_MAX_BYTES is per-channel-per-rank; tune with the BINE_FORCE_* builds.
+    size_t perChanBytes = (size_t)(end - offset) * sizeof(T);
 #if defined(BINE_FORCE_RELAY)
     bool useButterfly = false;
 #elif defined(BINE_FORCE_BUTTERFLY)
     bool useButterfly = (postFreq >= minPost);   // benchmarking: butterfly wherever it is SAFE
 #else
-    bool useButterfly = (perRankBytes <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost);
+    bool useButterfly = (perChanBytes <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost);
 #endif
 
     nOps = 0;

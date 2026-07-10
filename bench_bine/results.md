@@ -471,14 +471,30 @@ switch even for a 1 GB message -> butterfly's pairwise bandwidth limit bites (th
 regime the relay exists for). Small win is real and large (butterfly-mode 1 GB 5.98)
 matches the old pure-butterfly numbers.
 
-### FIX (same commit series): gate on PER-RANK message size, not postFreq
+### FIX ATTEMPT 1 (commit 68894ae): gate on full PER-RANK size -- CAUSED A DEADLOCK
 
-useButterfly = (count*sizeof(T) <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost).
-count*sizeof(T) = per-rank bytes: identical host/device AND channel-count-invariant, so
-the same total message picks the same mode at 2 or 16 channels. postFreq>=minPost kept
-as the deadlock-safety floor. BINE_BUTTERFLY_MAX_BYTES=256KB/rank (first cut from the
-default-channel crossover; tune with BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds).
-Offline gates pass (byte-identical op lists, channel-invariant mode selection). NEEDS
-HARDWARE RE-RUN: expect the default-channel small/mid wins preserved AND forced-16ch
-1 GB back to ~10 (relay), i.e. best-of-both: butterfly small + relay large at any
-channel count.
+useButterfly = (count*sizeof(T) <= THRESH) && (postFreq >= minPost). INTENT: count is
+channel-invariant. BUG: 'count' is NOT host/device-consistent -- on the device it is the
+FULL per-rank size, but the host proxy (proxy.cc:718-722) passes size=nbytes/nRanks
+(PER-CHANNEL) as count. So above 2 channels the proxy and kernel pick DIFFERENT modes ->
+different per-dim step counts -> NETWORK HANG. (2 channels survived only because the
+postFreq safety floor forced relay on both sides for the sizes that would otherwise
+straddle the threshold.) Reported: ">2 channels takes forever." fbc90c5's postFreq gate
+did NOT hang because postFreq derives from the chunk size, which IS consistent.
+
+### FIX ATTEMPT 2 (current): gate on THIS CHANNEL's per-rank bytes (end-offset)*sizeof(T)
+
+useButterfly = ((end-offset)*sizeof(T) <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost).
+(end-offset) = channelCount on the device and 'size' on the host -- the exact quantity the
+chunk loop already relies on being equal, so host and device agree by construction (no
+hang). It also scales the right way (less data/channel -> more latency-bound -> butterfly),
+so forced-16ch 1 GB -> ~1 MB/rank per channel -> above threshold -> RELAY (fixes the
+fbc90c5 regression too). BINE_BUTTERFLY_MAX_BYTES = 128 KB per-channel-per-rank (first cut;
+tune with BINE_FORCE_* builds). Offline gates pass (byte-identical op lists + host/device
+mode-consistency check added). NEEDS HARDWARE RE-RUN: expect no hang at any channel count,
+default small/mid wins preserved, forced-16ch 1 GB back to ~10 (relay).
+
+SAFETY VALVE for benchmarking: BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds skip the auto
+mode decision entirely (force-relay = always relay; force-butterfly = butterfly wherever
+postFreq is safe), so they CANNOT hit any mode-mismatch hang. Use BINE_FORCE_RELAY to get
+the large-message forced-channel win independently of the auto gate.
