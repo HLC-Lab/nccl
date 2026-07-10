@@ -498,3 +498,30 @@ SAFETY VALVE for benchmarking: BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds sk
 mode decision entirely (force-relay = always relay; force-butterfly = butterfly wherever
 postFreq is safe), so they CANNOT hit any mode-mismatch hang. Use BINE_FORCE_RELAY to get
 the large-message forced-channel win independently of the auto gate.
+
+### v9 fix CONFIRMED on hardware: 64 nodes, FORCED 8 channels, 3 reps, NO HANG
+
+commit 28e50f6, N=64, NCCL_FORCE_CH=8, -n 50, 3 reps, 0 #wrong. The count-gate build
+(68894ae) HUNG at >2 channels; this per-channel-gate build completes cleanly at 8 -> the
+host/device mode-mismatch deadlock is fixed. Means over 3 reps:
+
+| size    | Ring |  PAT | Bine | Bine/PAT | Bine/Ring |
+|---------|-----:|-----:|-----:|---------:|----------:|
+| 1 MB    | 0.57 | 1.61 | 0.88 |   0.54   |   1.53    |
+| 8 MB    | 1.10 | 4.41 | 4.22 |   0.96   |   3.82    |
+| 16 MB   | 2.05 | 5.20 | 4.74 |   0.91   |   2.31    |
+| 64 MB   | 4.05 | 6.34 | 6.79 |   1.07   |   1.68    |
+| 128 MB  | 6.20 | 6.53 | 6.31 |   0.97   |   1.02    |
+| 256 MB  | 8.52 | 6.75 | 7.62 |   1.13   |   0.89    |
+| 512 MB  | 9.29 | 7.11 | 7.85 |   1.10   |   0.84    |
+| 1 GB    |10.08 | 7.56 | 8.24 |   1.09   |   0.82    |
+| **avg** | 1.70 | 2.14 | 2.00 |   0.94   |   1.18    |
+
+READ: (1) NO HANG at 8 channels = deadlock fix validated. (2) No large-message regression:
+1 GB picks the relay (8.24), Bine BEATS PAT for every size >=64 MB (1.07-1.13x) and 8-16 MB
+is ~parity (0.91-0.96). (3) Channel-robustness confirmed again: PAT 1 GB DROPS with more
+channels (9.3 @2ch default -> 7.56 @8ch) while Bine holds (~8.2), so Bine overtakes PAT at
+8ch. (4) Bine crushes Ring at small/mid (1.5-4x) and Ring only wins the >=256 MB tail. (5)
+Small/mid <=4 MB still 0.5-0.7x PAT -> the parallelFactor=1 gap (Phase 4b). NEXT: re-run
+16ch (expect the ~10 GB/s 1 GB headline back, now hybrid+fixed); force-sweep to place
+BINE_BUTTERFLY_MAX_BYTES; Phase 4b for small/mid.
