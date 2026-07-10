@@ -522,6 +522,37 @@ READ: (1) NO HANG at 8 channels = deadlock fix validated. (2) No large-message r
 is ~parity (0.91-0.96). (3) Channel-robustness confirmed again: PAT 1 GB DROPS with more
 channels (9.3 @2ch default -> 7.56 @8ch) while Bine holds (~8.2), so Bine overtakes PAT at
 8ch. (4) Bine crushes Ring at small/mid (1.5-4x) and Ring only wins the >=256 MB tail. (5)
-Small/mid <=4 MB still 0.5-0.7x PAT -> the parallelFactor=1 gap (Phase 4b). NEXT: re-run
-16ch (expect the ~10 GB/s 1 GB headline back, now hybrid+fixed); force-sweep to place
-BINE_BUTTERFLY_MAX_BYTES; Phase 4b for small/mid.
+Small/mid <=4 MB still 0.5-0.7x PAT -> the parallelFactor=1 gap (Phase 4b).
+
+### v9 fix, 64 nodes, FORCED 16 channels, 3 reps (commit 28e50f6, HEAD confirmed)
+
+N=64, NCCL_FORCE_CH=16, -n 50, 3 reps, 0 #wrong, NO HANG.
+
+| size    | Ring |  PAT | Bine | Bine/PAT |
+|---------|-----:|-----:|-----:|---------:|
+| 1 MB    | 0.59 | 1.04 | 0.87 |   0.84   |
+| 4 MB    | 1.26 | 2.45 | 2.44 |   1.00   |
+| 8 MB    | 1.18 | 3.88 | 4.05 |   1.04   |
+| 16 MB   | 2.41 | 4.88 | 4.51 |   0.92   |
+| 32 MB   | 4.34 | 5.63 | 4.63 |   0.82   |  <- DIP
+| 64 MB   | 3.57 | 5.70 | 4.66 |   0.82   |  <- DIP
+| 128 MB  | 6.82 | 6.36 | 7.19 |   1.13   |
+| 256 MB  | 8.37 | 6.57 | 7.60 |   1.16   |
+| 1 GB    | 9.97 | 7.63 | 8.58 |   1.12   |
+| **avg** | 1.74 | 1.95 | 1.93 |   0.99   |
+
+READ: (1) NO HANG at 16 channels + 1 GB = 8.58 (relay), so the deadlock AND the
+fbc90c5 large-regression are both gone at 16ch too. (2) Bine BEATS PAT at large
+(>=128 MB, 1.12-1.16x) and at 4-8 MB (1.00-1.04x); ~parity overall (avg 0.99).
+(3) The absolute 1 GB is 8.58, not the earlier 1-rep 10.16 -- that was a
+good-placement allocation; THIS allocation is ~15% slower for ALL algos (PAT
+7.63 vs 8.54, Ring 9.97 vs 12). The stable, honest claim is the RATIO: Bine ~1.12x
+PAT at large. (4) NEW FINDING -- a DIP at 16-64 MB (0.82-0.92x): at 16 channels
+these sizes fall UNDER the 128 KB/channel butterfly threshold (32 MB -> 32 KB/rank
+per channel) so they run the BUTTERFLY, which underperforms the relay in that band
+(cf. 8ch where 64 MB used relay and hit 1.07x). => BINE_BUTTERFLY_MAX_BYTES=128 KB
+is too high; the butterfly should hand 16-64 MB back to the relay. This is the
+crossover-tuning item: force-sweep (BINE_FORCE_RELAY vs BINE_FORCE_BUTTERFLY builds)
+to place the threshold, expected to lift the 16-64 MB dip to relay's ~1.0x+.
+(5) Small/mid <=2 MB still 0.4-0.84x PAT (parallelFactor=1, Phase 4b). Bine > Ring
+everywhere except the >=256 MB tail.
