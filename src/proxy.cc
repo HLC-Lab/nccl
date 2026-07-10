@@ -718,7 +718,7 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       const ssize_t size = op->nbytes / comm->nRanks;
       const int rank = comm->rank, nranks = comm->nRanks;
       int *nstepsSend = NULL, *nstepsRecv = NULL;
-      PatAGAlgorithm<char> algo(comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, NCCL_STEPS, 16, 0, size, size,
+      PatAGAlgorithm<char> algo(comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, comm->bineXover, 0, size, size,
                                 op->chunkSize, rank, nranks);
       struct ncclPatStep ps = {0};
       NCCLCHECKGOTO(ncclCalloc(&nstepsSend, log2Up(nranks)), result, exit_pat_down);

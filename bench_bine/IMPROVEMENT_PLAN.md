@@ -226,9 +226,19 @@ construction cost removed) but likely still trail PAT — that is Phase 4.
 > exact quantity the chunk loop already needs equal, so host/device agree (no
 > hang) — and it scales the right way with channel count (fixes the regression:
 > 1 GB/16ch → ~1 MB/rank/channel → relay). `postFreq >= minPost` stays as the
-> packing-safety floor. `BINE_BUTTERFLY_MAX_BYTES = 128 KB` (per-channel-per-
-> rank) is a first cut; refine with the `BINE_FORCE_*` builds. LESSON in
-> Do-NOT #7: the mode input must be host/device-consistent.
+> packing-safety floor. LESSON in Do-NOT #7: the mode input must be
+> host/device-consistent.
+>
+> **RUNTIME KNOB (no recompile): `NCCL_BINE_XOVER`.** The crossover threshold is
+> now a per-communicator value plumbed from the `NCCL_BINE_XOVER` env var
+> exactly like `NCCL_BUFFSIZE` (host `comm->bineXover` → device
+> `ncclShmem.comm.bineXover`, set once at init so both sides agree). Units:
+> per-channel per-rank bytes. `=0` forces pure relay; a huge value (e.g.
+> `2000000000`) forces butterfly-wherever-safe; any value sweeps the crossover.
+> Default 128 KB (matches `BINE_BUTTERFLY_MAX_BYTES`). This replaces the two
+> `BINE_FORCE_*` builds for tuning — one build, sweep by env var. The observed
+> 16–64 MB dip at 64/128 nodes says the default is too high; sweep down (try
+> 65536, 32768, 16384 per-channel) and read off where relay overtakes butterfly.
 
 **Why**: the relay posts one block per FIFO slot and per network message;
 upstream PAT packs many small blocks per slot (`postFreq`) — that is the

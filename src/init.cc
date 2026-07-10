@@ -603,6 +603,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
+  tmpCommAndChans.comm.bineXover = comm->bineXover;
   tmpCommAndChans.comm.p2pChunkSize = comm->p2pChunkSize;
   tmpCommAndChans.comm.p2pCrossClique = comm->p2pCrossClique;
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];
@@ -814,6 +815,10 @@ static ncclResult_t setupChannel(struct ncclComm* comm, int channelId, int rank,
 NCCL_PARAM(BuffSize, "BUFFSIZE", -2);
 NCCL_PARAM(LlBuffSize, "LL_BUFFSIZE", -2);
 NCCL_PARAM(Ll128BuffSize, "LL128_BUFFSIZE", -2);
+// Bine AllGather butterfly/relay crossover, per-channel per-rank bytes. 0 => pure relay,
+// huge (e.g. 2000000000) => butterfly wherever safe, else the crossover. Default MUST
+// match BINE_BUTTERFLY_MAX_BYTES in collectives.h.
+NCCL_PARAM(BineXover, "BINE_XOVER", 128 * 1024);
 
 NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pPciChunkSize, "P2P_PCI_CHUNKSIZE", (1 << 17)); /* 128 kB */
@@ -826,6 +831,7 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
   for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
     comm->buffSizes[p] = envs[p] != -2 ? envs[p] : defaults[p];
   }
+  comm->bineXover = (int)ncclParamBineXover();
 
   if (comm->nNodes > 1) {
     // GBx platforms only have 4 GPUs per host, which reduces the aggregation factor.

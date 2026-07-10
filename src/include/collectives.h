@@ -786,13 +786,16 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // gate there (liveness) and bench_bine/timed_sim.py (throughput model).
 #define BINE_SKEW_LAMBDA 6
 
-// Butterfly (packed pairwise) is used when THIS CHANNEL's per-rank byte count
-// ((end-offset)*sizeof(T)) is at or below this threshold; above it the multi-peer relay
-// wins. Gated on the per-channel figure because that is the only size signal that is
-// consistent between the host proxy and the device kernel (see mode selection in the
-// constructor); a full-per-rank or postFreq gate either hangs or regresses. First-cut
-// crossover; refine with the BINE_FORCE_RELAY / BINE_FORCE_BUTTERFLY builds. Keep in
-// lockstep with the mirror in bench_bine/verify_schedule.py.
+// DEFAULT butterfly/relay crossover: butterfly (packed pairwise) is used when THIS
+// CHANNEL's per-rank byte count ((end-offset)*sizeof(T)) is at or below the threshold;
+// above it the multi-peer relay wins. Gated on the per-channel figure because that is the
+// only size signal consistent between the host proxy and the device kernel (see the
+// constructor); a full-per-rank or postFreq gate either hangs or regresses. This is only
+// the DEFAULT -- the live value is per-communicator and set at runtime from the
+// NCCL_BINE_XOVER env var (comm->bineXover, plumbed like NCCL_BUFFSIZE): set 0 to force
+// pure relay, a huge value (e.g. 2000000000) to force butterfly-wherever-safe, or a
+// specific per-channel byte crossover to sweep. Keep this default in lockstep with the
+// mirror in bench_bine/verify_schedule.py and the NCCL_PARAM default in init.cc.
 #define BINE_BUTTERFLY_MAX_BYTES (128 * 1024)
 
 template <typename T>
@@ -865,10 +868,12 @@ class PatAGAlgorithm {
   }
 
 public:
-  __device__ __host__ PatAGAlgorithm(int slotBytes, int stepDepth, int maxParallelFactor, size_t offset, size_t end,
+  // xoverBytes: butterfly/relay crossover on THIS channel's per-rank bytes, from
+  // comm->bineXover (NCCL_BINE_XOVER; default BINE_BUTTERFLY_MAX_BYTES). Same value on
+  // host and device by construction (set once at init, copied into the device comm).
+  __device__ __host__ PatAGAlgorithm(int slotBytes, int xoverBytes, size_t offset, size_t end,
                                      size_t count, int chunkCount, int rank, int nranks)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
-    (void)stepDepth; (void)maxParallelFactor;
     nsteps = log2Up(nranks);
     nelem = getNelem();
 
@@ -908,7 +913,9 @@ public:
 #elif defined(BINE_FORCE_BUTTERFLY)
     bool useButterfly = (postFreq >= minPost);   // benchmarking: butterfly wherever it is SAFE
 #else
-    bool useButterfly = (perChanBytes <= BINE_BUTTERFLY_MAX_BYTES) && (postFreq >= minPost);
+    // Runtime crossover from NCCL_BINE_XOVER (per-channel per-rank bytes): 0 => pure relay,
+    // huge => butterfly wherever safe, else the sweep point. postFreq>=minPost is the floor.
+    bool useButterfly = (perChanBytes <= (size_t)xoverBytes) && (postFreq >= minPost);
 #endif
 
     nOps = 0;

@@ -444,6 +444,7 @@ struct ncclKernelComm {
   int p2pChunkSize;
   bool p2pCrossClique;
   int isAllNvlink;
+  int bineXover; // Bine AllGather butterfly/relay crossover (per-channel per-rank bytes), from NCCL_BINE_XOVER
 
   int* collNetDenseToUserRank;
 
