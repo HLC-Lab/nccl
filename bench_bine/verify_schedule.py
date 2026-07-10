@@ -526,8 +526,11 @@ def mode_of(n, slot_bytes, chunk_bytes, per_chan_bytes):
     per_chan_bytes = (end-offset)*sizeof(T), THIS channel's per-rank bytes -- the only
     signal that is identical on host proxy and device kernel (a full-per-rank or postFreq
     gate hangs or regresses; see the constructor comment). Butterfly iff that is <=
-    threshold AND packing is deadlock-safe."""
-    pf = (slot_bytes // chunk_bytes) if chunk_bytes > 0 else 1
+    threshold AND packing is deadlock-safe. The pack unit is the ACTUAL slice
+    (min(per_chan, chunk) bytes), not the chunk capacity: tiny messages pack many more
+    blocks per slot (fewer network posts)."""
+    slice_bytes = per_chan_bytes if per_chan_bytes < chunk_bytes else chunk_bytes
+    pf = (slot_bytes // slice_bytes) if slice_bytes > 0 else 1
     if pf < 1:
         pf = 1
     if pf > n // 2:
@@ -563,7 +566,13 @@ def run_phase4():
         hd_consistent = all(
             mode_of(n, SLOT, 8192, fpr // nch)[1] == mode_of(n, SLOT, 8192, fpr // nch)[1]
             for fpr in (1 << 20, 64 << 20) for nch in (1, 2, 4, 8, 16))
-        msel_ok = (small_modes == {True}) and (large_modes == {False}) and hd_consistent
+        # postFreq pack-unit: tiny slices pack by ACTUAL size (n/2 cap), multi-chunk by
+        # chunk capacity. E.g. 512 B slices in a 512 KB slot -> pf = min(1024, n/2).
+        pf_tiny = mode_of(n, 512 * 1024, 65536, 512)[0]
+        pf_big = mode_of(n, 512 * 1024, 65536, 16 << 20)[0]
+        pf_ok = (pf_tiny == min(1024, n // 2) if n > 2 else pf_tiny >= 1) and \
+                (pf_big == min(8, n // 2) if n > 2 else pf_big >= 1)
+        msel_ok = (small_modes == {True}) and (large_modes == {False}) and hd_consistent and pf_ok
         good = (not e and all(x == 'OK' for x in res) and r3 == 'OK'
                 and not cerrs and msel_ok)
         ok &= good

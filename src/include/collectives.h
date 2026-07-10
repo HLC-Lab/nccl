@@ -879,12 +879,20 @@ public:
     nsteps = log2Up(nranks);
     nelem = getNelem();
 
-    // postFreq = blocks packed into one FIFO slot / one network post. Computed
-    // identically on host (T=char, chunkCount in bytes) and device (chunkCount in
-    // elements, *sizeof(T)) since both equal the chunk byte size, keeping the two
-    // op lists in lockstep. Clamp to [1, nranks/2] (n/2 = largest butterfly round).
+    // postFreq = blocks packed into one FIFO slot / one network post. The pack unit is
+    // the ACTUAL per-op slice, not the chunk capacity: when the whole channel fits in a
+    // single chunk (end-offset <= chunkCount, i.e. exactly the small-message regime),
+    // every op moves only (end-offset) elements -- enqueue floors chunkCount at 64 KB, so
+    // dividing by chunkBytes under-packs tiny messages by up to 64KB/actual (e.g. 1 MB at
+    // 128 ranks x 16 channels: 512 B slices packed 8/slot instead of 64/slot = 2.5x the
+    // network posts). Both chunkCount and (end-offset) are host/device-consistent, and
+    // multi-chunk messages (end-offset > chunkCount) keep the old chunkBytes behavior.
+    // Computed identically on host (T=char, sizes in bytes) and device (elements,
+    // *sizeof(T)). Clamp to [1, nranks/2] (n/2 = largest butterfly round).
     int chunkBytes = chunkCount * (int)sizeof(T);
-    int postFreq = (chunkBytes > 0) ? (slotBytes / chunkBytes) : 1;
+    int sliceBytes = ((size_t)(end - offset) < (size_t)chunkCount)
+                       ? (int)((end - offset) * sizeof(T)) : chunkBytes;
+    int postFreq = (sliceBytes > 0) ? (slotBytes / sliceBytes) : 1;
     if (postFreq < 1) postFreq = 1;
     if (postFreq > nranks / 2) postFreq = nranks / 2;
     int minPost = (nranks / 2 + NCCL_STEPS - 1) / NCCL_STEPS; // divUp(nranks/2, NCCL_STEPS)
