@@ -556,3 +556,31 @@ crossover-tuning item: force-sweep (BINE_FORCE_RELAY vs BINE_FORCE_BUTTERFLY bui
 to place the threshold, expected to lift the 16-64 MB dip to relay's ~1.0x+.
 (5) Small/mid <=2 MB still 0.4-0.84x PAT (parallelFactor=1, Phase 4b). Bine > Ring
 everywhere except the >=256 MB tail.
+
+## 2026-07-10 — v9 at 128 NODES: no hang at any channel count (MILESTONE)
+
+commit 28e50f6. N=128, -n as noted, 1 rep each (INDICATIVE, noisy -- multi-rep TODO), 0
+#wrong everywhere. 128 nodes is where the pre-fix (depth-order) code deadlocked; it now
+runs clean at 4, 8, and 16 channels -> deadlock retired on HW to 128n (guard allows 256).
+
+Bine/PAT at large (across ch4/ch8/ch16, 1 rep so +/- noise):
+
+| size    | ch4  | ch8  | ch16(-n40) |
+|---------|-----:|-----:|-----------:|
+| 64 MB   | 1.17 | 0.83 | 0.86       |
+| 128 MB  | 1.01 | 1.11 | 1.14       |
+| 256 MB  | 1.12 | 1.13 | 1.09       |
+| 512 MB  | 0.80 | 0.96 | 1.15       |
+| 1 GB    | 1.15 | 1.11 | 1.11       |
+
+READ: (1) NO HANG at 128 nodes, all channel counts = deadlock fully retired on HW.
+(2) Bine BEATS PAT at large (>=128 MB ~1.09-1.15x, 1 GB 1.11-1.15x) at 128 nodes too --
+the multi-peer-width win scales. 1 GB abs: Bine 7.12(ch4)/8.23(ch8)/8.72(ch16) vs PAT
+6.21/7.43/7.83; both scale up with channels here, Bine stays ~1.1x ahead. (3) The MID-SIZE
+DIP (16-64 MB, butterfly overused) is present and a bit worse than 64n (minPost=divUp(64,8)
+=8 at n=128, so the butterfly region is larger): ch16 32 MB 0.79, 64 MB 0.86; ch8 32 MB
+0.42. Confirms the BINE_BUTTERFLY_MAX_BYTES tuning is needed (threshold too high) -- now seen
+at BOTH 64n and 128n. (4) Small/mid <=4 MB 0.4-0.75x (parallelFactor=1). (5) Bine >> Ring
+small/mid (2-4.6x); Ring wins only >=512 MB. avg Bine ~0.90x PAT (dragged by small/mid+dip).
+CAVEAT: 1 rep -> the 512 MB ch4 0.80 and 32 MB ch8 0.42 are likely noise; re-run >=3 reps
+for any quoted number. NEXT: force-sweep to fix the mid-dip threshold; then 3-rep clean sweep.
