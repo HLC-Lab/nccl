@@ -318,6 +318,33 @@ Any design must pass a grouped-execution extension of the simulator (model:
 plus hardware `-c 1` at every node count. If this proves invasive, stop —
 Phases 1–4 already deliver correct scaling + a competitive sweep.
 
+> **STUDIED 2026-07-10 — VERDICT: STOP (documented negative result).**
+> `bench_bine/group_sim.py` models device group semantics faithfully (op i →
+> group i%P, sequential per group, 32-slot op-ring as the only cross-group
+> happens-before) and shows:
+> 1. **Naive P>1 on today's lists races**: 21–64 output-RAW pairs and 70–231
+>    per-dim FIFO-state pairs at n=64/128 for P=2..16. parallelFactor=1 is not
+>    an oversight; it is required by the current op structure.
+> 2. **Same-dim ops cannot usefully overlap anyway** (per-connection posts are
+>    FIFO-ordered), so grouped parallelism = cross-dim only, and dim-0 owns
+>    half of each direction's traffic → load-balance ceiling 4.0x, with
+>    cross-dim dependency chains and credits binding well below that.
+> 3. **Best candidate** (unfused v6-style relay + dim-side group ownership +
+>    explicit cross-group dependency counters): timed model gives 1.51–1.63x
+>    over today's P=1 fused relay in the latency-bound regime — but the
+>    **already-shipped slice-packing fix delivers 1.34–1.37x of that for
+>    free** (same model, same regime). Marginal gain of full 4b ≈ 1.1–1.2x,
+>    against: unfusing (2x copy, a third schedule), a new device dependency
+>    mechanism, skip-padding to realize group maps, fresh liveness analysis
+>    under grouped execution, and full re-verification. Poor ROI → per this
+>    section's own stop rule, Phase 4b is closed. Re-open only if a future
+>    design removes the dim-0 serialization (e.g. multiple connections per
+>    dim), which changes the ceiling.
+> Context for the small-size numbers: at ≤1 MB with FORCED 16 channels the
+> per-channel slices are 512 B–4 KB — a configuration auto-tuning would never
+> pick (NCCL reduces channel count for small messages). The forced-channel
+> benchmark overstates the practical small-message gap for all algorithms.
+
 ---
 
 ## Phase 5 — optional hygiene (any order, low risk)
