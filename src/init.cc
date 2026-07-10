@@ -817,8 +817,8 @@ NCCL_PARAM(LlBuffSize, "LL_BUFFSIZE", -2);
 NCCL_PARAM(Ll128BuffSize, "LL128_BUFFSIZE", -2);
 // Bine AllGather butterfly/relay crossover, per-channel per-rank bytes. 0 => pure relay,
 // huge (e.g. 2000000000) => butterfly wherever safe, else the crossover. Default MUST
-// match BINE_BUTTERFLY_MAX_BYTES in collectives.h.
-NCCL_PARAM(BineXover, "BINE_XOVER", 128 * 1024);
+// match BINE_BUTTERFLY_MAX_BYTES in collectives.h (64 KB, tuned at 64n/16ch).
+NCCL_PARAM(BineXover, "BINE_XOVER", 64 * 1024);
 
 NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pPciChunkSize, "P2P_PCI_CHUNKSIZE", (1 << 17)); /* 128 kB */

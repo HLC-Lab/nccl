@@ -518,7 +518,7 @@ def run_phase2():
     return ok
 
 
-BINE_BUTTERFLY_MAX_BYTES = 128 * 1024  # must match src/include/collectives.h (per-CHANNEL per-rank bytes)
+BINE_BUTTERFLY_MAX_BYTES = 64 * 1024  # must match src/include/collectives.h (per-CHANNEL per-rank bytes; tuned 64n/16ch)
 
 
 def mode_of(n, slot_bytes, chunk_bytes, per_chan_bytes):

@@ -796,7 +796,9 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // pure relay, a huge value (e.g. 2000000000) to force butterfly-wherever-safe, or a
 // specific per-channel byte crossover to sweep. Keep this default in lockstep with the
 // mirror in bench_bine/verify_schedule.py and the NCCL_PARAM default in init.cc.
-#define BINE_BUTTERFLY_MAX_BYTES (128 * 1024)
+// 64 KB: tuned from the 64-node/16-channel same-allocation sweep (xover_sweep.sh) -- best
+// average, and it captures the 4-16 MB butterfly wins. Revisit if 8ch/128n sweeps disagree.
+#define BINE_BUTTERFLY_MAX_BYTES (64 * 1024)
 
 template <typename T>
 class PatAGAlgorithm {

@@ -584,3 +584,45 @@ at BOTH 64n and 128n. (4) Small/mid <=4 MB 0.4-0.75x (parallelFactor=1). (5) Bin
 small/mid (2-4.6x); Ring wins only >=512 MB. avg Bine ~0.90x PAT (dragged by small/mid+dip).
 CAVEAT: 1 rep -> the 512 MB ch4 0.80 and 32 MB ch8 0.42 are likely noise; re-run >=3 reps
 for any quoted number. NEXT: force-sweep to fix the mid-dip threshold; then 3-rep clean sweep.
+
+## 2026-07-10 — NCCL_BINE_XOVER runtime knob + crossover sweep (64n, 16ch)
+
+commit 9868c2f made the butterfly/relay crossover a runtime env var NCCL_BINE_XOVER
+(per-channel per-rank bytes; 0=relay, huge=butterfly, else crossover), plumbed like
+NCCL_BUFFSIZE (host comm->bineXover -> device, set once = host/device consistent).
+xover_sweep.sh runs all XOVER values + PAT in one allocation.
+
+### Sweep (64n, 16ch, 2 reps): AVG busbw by XOVER
+
+| XOVER  | relay(0) | 16K  | 32K  | 64K  | 128K | bfly | PAT  |
+|--------|---------:|-----:|-----:|-----:|-----:|-----:|-----:|
+| avg    |    3.03  | 3.47 | 3.53 |3.57* | 3.49 | 3.43 | 3.39 |
+
+64K best avg (beats PAT avg 3.39), and owns the 32K-16M mid-range per-size. 128K (the
+old default) was 3.49. => default lowered 128K -> 64K (commit pending). NOTE the mid-large
+dip is NOT threshold-fixable: at 33M ALL Bine modes (~5.5-5.8) trail PAT (~8.5); pure relay
+is actually WORST there (4.85) because relay hasn't ramped to plateau yet while PAT has.
+
+### Clean confirm (64n, 16ch, NCCL_BINE_XOVER=65536, 3 reps, 0 #wrong)
+
+| size    | Ring  |  PAT  | Bine  | Bine/PAT |
+|---------|------:|------:|------:|---------:|
+| 1 MB    | 1.62 |  0.85 |  0.83 |   0.98   |
+| 2 MB    | 1.67 |  1.62 |  1.32 |   0.81   |
+| 4 MB    | 1.75 |  2.03 |  2.55 |   1.26   |  <- Bine wins
+| 8 MB    | 2.40 |  2.82 |  4.01 |   1.42   |  <- Bine wins
+| 16 MB   | 6.46 |  4.49 |  4.70 |   1.05   |
+| 33 MB   | 8.35 |  7.66 |  5.00 |   0.65   |  <- dip (structural, not threshold)
+| 67 MB   | 7.52 |  6.82 |  4.77 |   0.70   |  <- dip
+| 128 MB  |10.28 |  7.62 |  7.53 |   0.99   |
+| 256 MB  |10.52 |  7.36 |  8.73 |   1.19   |  <- Bine wins
+| 1 GB    |10.65 |  7.94 |  9.07 |   1.14   |  <- Bine wins
+| **avg** | 2.56 |  2.10 |  2.06 |   0.98   |
+
+HONEST PICTURE at 16ch/64n (clean 3-rep): Bine ~= PAT overall (0.98). Bine WINS 4-16 MB
+(butterfly, 1.05-1.42x) and >=256 MB (relay, 1.14-1.19x); LOSES <=2 MB (parallelFactor=1)
+and 33-67 MB (transitional: relay not yet at plateau, butterfly below PAT -- both modes
+lose, threshold can't fix). Ring is best overall here (2.56) but that is the BW-optimal
+baseline; the tree-vs-tree result (Bine vs PAT) is PARITY-with-band-wins. To beat PAT at
+MOST sizes needs Phase 4b (parallelFactor>1) for <=2 MB and a fix for the 33-67 MB ramp
+(sub-chunking / pipeline fill), NOT more threshold tuning.
