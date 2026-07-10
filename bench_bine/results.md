@@ -626,3 +626,30 @@ lose, threshold can't fix). Ring is best overall here (2.56) but that is the BW-
 baseline; the tree-vs-tree result (Bine vs PAT) is PARITY-with-band-wins. To beat PAT at
 MOST sizes needs Phase 4b (parallelFactor>1) for <=2 MB and a fix for the 33-67 MB ramp
 (sub-chunking / pipeline fill), NOT more threshold tuning.
+
+### 128 nodes, 16ch, XOVER=65536, 1 rep -n50 (INDICATIVE) -- large win HOLDS, mid erodes
+
+N=128 (1 GPU/node), 0 #wrong, no hang. 1 rep on a 10-min QOS alloc -> magnitudes noisy.
+
+| size    | Ring  |  PAT  | Bine  | Bine/PAT |
+|---------|------:|------:|------:|---------:|
+| 4 MB    | 0.66 |  4.15 |  1.12 |   0.27   |  <- butterfly, LOST (won at 64n!)
+| 8 MB    | 0.71 |  4.28 |  2.40 |   0.56   |
+| 16 MB   | 1.34 |  4.26 |  3.44 |   0.81   |
+| 33 MB   | 2.10 |  4.04 |  5.64 |   1.40   |  (noisy: adjacent 67M dips)
+| 67 MB   | 4.29 |  5.92 |  3.32 |   0.56   |
+| 128 MB  | 6.26 |  6.23 |  7.47 |   1.20   |  <- Bine wins
+| 256 MB  | 5.78 |  6.48 |  6.83 |   1.05   |
+| 512 MB  | 7.99 |  6.77 |  7.60 |   1.12   |
+| 1 GB    | 9.05 |  6.76 |  8.00 |   1.18   |  <- Bine wins
+| **avg** | 1.39 |  1.93 |  1.70 |   0.88   |
+
+READ: (1) LARGE WIN HOLDS AT 128n: >=128 MB Bine 1.05-1.20x PAT (four consecutive sizes,
+robust even at 1 rep) -- the multi-peer-width advantage scales. (2) BUTTERFLY ERODES WITH
+SCALE: the 4-16 MB butterfly wins seen at 64n did NOT reproduce at 128n (4M 0.27, 8M 0.56)
+-- log2(n)=7 rounds + smaller per-block data weaken the pairwise butterfly at 128 nodes.
+=> the 64 KB default is 64n-tuned; 128n likely wants its own (lower) crossover, BUT chasing
+it per-node-count is a losing game -- the real small/mid lever is Phase 4b (parallelFactor
+>1). (3) avg 0.88x (vs 0.98 at 64n): Bine relatively weaker at 128n, dragged by small/mid.
+CAVEAT: 1 rep; 33M 1.40 / 67M 0.56 are adjacent opposite spikes = noise; re-run 3 reps for
+any quoted small/mid number. Large (>=128M) is trustworthy.
