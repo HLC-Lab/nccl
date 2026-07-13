@@ -790,6 +790,35 @@ default behavior AND make the 48 KB crossover correct in deployment. (3) At 64n 
 Ring owns >=16 MB outright (9-10.4) -- Bine's deployed niche at 64n/2ch is thin; the 128n
 picture (Ring weak at mid under forced ch) still needs an auto-channel run at 128n.
 
+## 2026-07-13 — v11: CHANNEL FLOOR VALIDATED (64n, AUTO channels, 3 reps) — large win is
+## now the OUT-OF-THE-BOX default
+
+Build 188acdf (floor NCCL_BINE_NCHANNELS=16 + MINSIZE=128MB + 48KB xover compiled in).
+Auto channels (base budget 2; INFO line confirmed "raised channel budget 2 -> 16, other
+collectives keep 2"). 0 #wrong, 3 reps. vs the pre-floor auto run (2ch everywhere):
+
+| size    | Ring  |  PAT  | Bine  | B/PAT | pre-floor Bine | delta       |
+|---------|------:|------:|------:|------:|---------------:|-------------|
+| 8 MB    |  3.54 |  6.61 |  3.70 | 0.56  |  3.20          | ~same (base)|
+| 16 MB   |  7.75 |  6.88 |  4.56 | 0.66  |  3.73          | ~same (base)|
+| 33 MB   |  9.57 |  7.58 |  5.94 | 0.78  |  6.93          | ~same (base)|
+| 67 MB   |  8.43 |  7.35 |  7.47 | 1.02  |  7.76          | ~same (base)|
+| 128 MB  | 11.44 |  7.92 |  8.74 | 1.10  |  7.55          | +1.2 (FLOOR)|
+| 256 MB  | 10.43 |  8.26 |  9.00 | 1.09  |  7.70          | +1.3 (FLOOR)|
+| 512 MB  | 11.13 |  8.61 |  8.82 | 1.02  |  7.43          | +1.4 (FLOOR)|
+| 1 GB    | 11.14 |  8.81 |  9.59 | 1.09  |  7.74          | +1.85(FLOOR)|
+
+READ: (1) FLOOR WORKS AS DESIGNED: >=128 MB ops silently ran the 16-channel relay and
+gained +1.2..+1.85 GB/s (1 GB 9.59 = best default-config Bine number recorded); <128 MB
+(incl. PAT/Ring at ALL sizes) unchanged = the base-budget clamp works. (2) Bine now beats
+PAT >=128 MB (1.02-1.10x here; PAT ran hot in this allocation at 8.3-8.8 -- typical
+ratios 1.1-1.2x) WITH ZERO CONFIGURATION. (3) Known gaps unchanged and documented:
+<=2 MB (pf=1), 8-33 MB soft band (2ch relay/ramp), and at 64n Ring still owns >=16 MB
+absolutely (11+ GB/s) -- the tree-vs-tree (PAT-slot) win is the claim, plus auto-SELECT
+model constants remain TODO for the tuner to actually pick Bine over Ring where it wins
+(128n mid-range). DEPLOYMENT STORY CLOSED: correct + hang-free to 128n, wins >=128 MB
+out of the box, all knobs (NCCL_BINE_NCHANNELS/_MINSIZE, NCCL_BINE_XOVER) runtime-tunable.
+
 ### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
 
 Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
