@@ -693,3 +693,39 @@ BOTTOM LINE 128n (3-rep): Bine BEATS PAT >=256 MB at 16ch (1.12-1.14x) and >=512
 (7 rounds, smaller blocks). avg ~0.89 both channel counts. CONCLUSION: threshold tuning is
 EXHAUSTED as a lever; the small/mid gap at scale is parallelFactor=1 (Phase 4b) territory,
 plus the 33-67 MB relay ramp (sub-chunking/pipeline-fill).
+
+## 2026-07-13 — v10: slice-packing fix VALIDATED (64n, 16ch, 3 reps, default XOVER=64KB)
+
+Rebuilt with d4339d8 (butterfly packs by actual slice size, not the 64KB-floored chunk
+capacity). 0 #wrong, 3 reps. This allocation runs ~6-9% faster overall than the 07-10 one
+(Ring avg 2.72 vs 2.56, PAT 2.27 vs 2.10) -- gains beyond that are the fix.
+
+| size    | PAT   | Bine  | Bine/PAT | vs 07-10 run: Bine abs / ratio |
+|---------|------:|------:|---------:|--------------------------------|
+| 16 KB   |  0.06 |  0.03 |   0.50   | 0.02->0.03 (+50%) / 0.37->0.50 |
+| 32 KB   |  0.11 |  0.06 |   0.53   | 0.04->0.06 (+50%) / 0.41->0.53 |
+| 64 KB   |  0.20 |  0.13 |   0.64   | 0.09->0.13 (+44%) / 0.52->0.64 |
+| 128 KB  |  0.31 |  0.19 |   0.61   | 0.15->0.19 (+27%) / 0.54->0.61 |
+| 256 KB  |  0.44 |  0.30 |   0.67   | 0.25->0.30 (+20%)              |
+| 2 MB    |  1.66 |  1.54 |   0.93   | 1.32->1.54 (+17%) / 0.81->0.93 |
+| 4 MB    |  2.72 |  2.86 |   1.05   | (PAT much higher this alloc)   |
+| 8 MB    |  4.57 |  4.13 |   0.90   |                                |
+| 16 MB   |  5.61 |  5.42 |   0.97   |                                |
+| 33 MB   |  6.72 |  5.54 |   0.82   | dip persists (structural)      |
+| 67 MB   |  7.85 |  5.40 |   0.69   | dip persists                   |
+| 128 MB  |  7.71 |  8.61 |   1.12   | <- Bine wins                   |
+| 256 MB  |  7.66 |  8.82 |   1.15   | <- Bine wins                   |
+| 512 MB  |  7.61 |  8.81 |   1.16   | <- Bine wins                   |
+| 1 GB    |  8.17 |  9.33 |   1.14   | <- Bine wins                   |
+| **avg** |  2.27 |  2.24 |   0.99   | parity (rep3: Bine > PAT)      |
+
+READ: (1) PACKING FIX CONFIRMED: tiny sizes up 44-50% absolute (16-64 KB), way beyond the
+~8% allocation effect, matching the timed model's 1.34-1.37x prediction; ratios at <=256 KB
+lifted from 0.37-0.54 to 0.50-0.67. (2) Large headline reconfirmed a THIRD time at 64n:
+>=128 MB = 1.12-1.16x PAT. (3) avg parity (0.99). (4) The 33-67 MB dip persists as expected
+(both these sizes run the butterfly at the 64 KB default -- 67 MB sits exactly on the
+boundary; the sweep showed butterfly >= relay there, so it is structural, not mode choice).
+Remaining known gaps: <=1 MB (0.5-0.8x, forced-16ch config auto-tune would never pick) and
+33-67 MB ramp. NEXT (optional): re-run xover_sweep.sh (threshold was tuned pre-fix; optimum
+can only move UP from 64 KB), and a 128n rep to see how much the fix recovers there
+(packing gain is largest at 128n: 64 blocks/slot vs 8).
