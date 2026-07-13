@@ -762,6 +762,34 @@ with the forced-channel tax. => 16ch is Bine's sweet spot at 128n; "delay Ring" 
 structural fix (channel-rotation v11 idea, or understanding the ~8.8 ceiling), not more
 channels.
 
+### AUTO-CHANNEL run (64n, default channels = 2, XOVER=49152, 1 rep): the deployed-default
+### picture + the crossover is CHANNEL-BUDGET-DEPENDENT
+
+| size    | Ring |  PAT | Bine | B/PAT | mode @2ch,48K | July-9 default run (bfly there) |
+|---------|-----:|-----:|-----:|------:|---------------|---------------------------------|
+| 1 MB    | 0.40 | 2.62 | 1.47 | 0.56  | bfly          | 0.50                            |
+| 4 MB    | 2.45 | 4.14 | 4.03 | 0.97  | bfly (32K/ch) | 0.71                            |
+| 8 MB    | 2.72 | 7.34 | 3.20 | 0.44  | RELAY (64K/ch)| 0.80 (Bine 5.13, was BFLY)      |
+| 16 MB   | 9.00 | 7.54 | 3.73 | 0.49  | RELAY (128K)  | 0.77 (Bine 5.97, was BFLY)      |
+| 33 MB   | 9.95 | 6.90 | 6.93 | 1.00  | relay         | 0.86                            |
+| 67 MB   | 9.51 | 6.78 | 7.76 | 1.14  | relay         | 0.92                            |
+| 1 GB    |10.00 | 7.56 | 7.74 | 1.02  | relay         | 0.95                            |
+
+READS: (1) 8-16 MB CRATERED (0.44/0.49; abs 3.20/3.73 vs 5.13/5.97 on July 9): the 48 KB
+crossover -- tuned at 16 CHANNELS -- flips these sizes to the RELAY at 2 channels, but with
+only 2 channel-pipelines the relay cannot hide latency at 64-128 KB slices; the butterfly
+(safe there: pf 8/4 >= minPost 4) was right, as July 9 shows. => THE OPTIMAL CROSSOVER
+DEPENDS ON THE CHANNEL BUDGET, not just per-channel slice bytes: ~48 KB at >=8-16ch,
+>=128 KB (butterfly-where-safe) at 2-4ch. Workaround for default-channel runs:
+NCCL_BINE_XOVER=131072. (2) DEPLOYED DEFAULT = 2 CHANNELS: Bine large = 7.4-7.8 = PAT
+parity (1.00-1.14 this alloc, 0.86-0.97 July 9) -- the +12-16% large win REQUIRES the
+8-16ch budget NCCL never grants by default. PAT is tuned for 2ch; Bine is the only algo
+here that gains from more. => the Phase-5 init-time channel floor (NVLS-style) for
+Bine-capable comms is THE product fix: it would make the entire forced-16ch result set the
+default behavior AND make the 48 KB crossover correct in deployment. (3) At 64n default,
+Ring owns >=16 MB outright (9-10.4) -- Bine's deployed niche at 64n/2ch is thin; the 128n
+picture (Ring weak at mid under forced ch) still needs an auto-channel run at 128n.
+
 ### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
 
 Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
