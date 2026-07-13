@@ -744,3 +744,14 @@ butterfly wins at <=32 KB perChan slices, relay wins at >=64 KB perChan.
 => DEFAULT MOVED 64 KB -> 48 KB (between the two boundary cases): keeps 33 MB@64n and
 67 MB@128n on the butterfly, returns 67 MB@64n and 128 MB@128n to the relay (each worth
 +25-35% at its size per the measurements above).
+
+### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
+
+Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
+butterfly; everything else within noise of the 64 KB runs. Full >=128 MB band now wins:
+1.05 / 1.13 / 1.16 / 1.19 (128M/256M/512M/1G). This run also had 8-16 MB at 1.05 and
+avg Bine 2.00 > PAT 1.94 -- FIRST avg win at 128 nodes (1 rep; the stable claim remains
+"parity avg, wins >=128 MB"). Runtime knob validated end-to-end (no rebuild needed; note
+the env var must be NCCL_BINE_XOVER -- plain BINE_XOVER is silently ignored, tested).
+Remaining soft spots unchanged: <=4 MB (0.25-0.77, pf=1 + forced-ch artifact) and the
+33-67 MB butterfly band (0.73-0.90).
