@@ -797,7 +797,10 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // specific per-channel byte crossover to sweep. Keep this default in lockstep with the
 // mirror in bench_bine/verify_schedule.py and the NCCL_PARAM default in init.cc.
 // 64 KB: tuned from the 64-node/16-channel same-allocation sweep (xover_sweep.sh) -- best
-// average, and it captures the 4-16 MB butterfly wins. Revisit if 8ch/128n sweeps disagree.
+// average, and it captures the 4-16 MB butterfly wins. NOTE: tuned BEFORE the slice-based
+// packing fix, which makes the butterfly strictly faster at tiny slices (and newly enables
+// it at nranks=256, where the old chunk-capacity postFreq of 8 < minPost 16 blocked it) --
+// re-run xover_sweep.sh after that rebuild; the optimum can only move UP from 64 KB.
 #define BINE_BUTTERFLY_MAX_BYTES (64 * 1024)
 
 template <typename T>
