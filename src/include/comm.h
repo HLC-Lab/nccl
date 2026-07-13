@@ -633,6 +633,10 @@ struct ncclComm {
   // Bine AllGather butterfly/relay crossover (per-channel per-rank bytes), from
   // NCCL_BINE_XOVER; copied into the device comm and read by PatAGAlgorithm on both sides.
   int bineXover;
+  // When != 0, channels above this count exist only for large Bine AllGather ops
+  // (NCCL_BINE_NCHANNELS floor, see ncclTopoPostset); every other op's per-op channel
+  // count is clamped to this pre-floor budget in topoGetAlgoInfo.
+  int bineBaseChannels;
 
   // Cross-clique P2P: when true, use global rank for IPC buffer indexing
   bool p2pCrossClique;

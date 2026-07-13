@@ -29,6 +29,11 @@
 NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 NCCL_PARAM(AllgathervEnable, "ALLGATHERV_ENABLE", 1);
 NCCL_PARAM(SymCeThreshold, "SYM_CE_THRESHOLD", 8 * 1024 * 1024);
+// Bine AllGather ops at or above this TOTAL message size use the full
+// NCCL_BINE_NCHANNELS channel budget; smaller ones keep the pre-floor budget
+// (latency-bound; measured faster at few channels). 128 MB = the size from which
+// the 16-channel relay beat the base budget at BOTH 64 and 128 nodes on Leonardo.
+NCCL_PARAM(BineNchannelsMinBytes, "BINE_NCHANNELS_MINSIZE", 128 * 1024 * 1024);
 
 // Returns maximum kernel stack size of all CUDA kernels
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
@@ -2068,6 +2073,17 @@ static ncclResult_t topoGetAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* 
   TRACE(NCCL_COLL, "%ld Bytes -> Algo %d proto %d time %f", nBytes, info->algorithm, info->protocol, time);
 
   int nc = comm->nChannels;
+  if (comm->bineBaseChannels > 0) {
+    // Channels above bineBaseChannels exist only for the Bine AllGather path
+    // (NCCL_BINE_NCHANNELS floor, ncclTopoPostset). Every other collective keeps the
+    // topology-derived budget it would have had without the floor -- and so do SMALL
+    // Bine ops: they are latency-bound and measure FASTER at the base budget (Leonardo
+    // 64n: 8 MB 5.1 GB/s at 2ch vs 4.1 at 16ch), while the relay's multi-peer width
+    // only pays off at large sizes (128 MB+: 8.6 at 16ch vs 7.7 at 2ch).
+    bool bigBine = info->func == ncclFuncAllGather && info->algorithm == NCCL_ALGO_PAT &&
+                   nBytes >= (size_t)ncclParamBineNchannelsMinBytes();
+    if (!bigBine) nc = std::min(nc, comm->bineBaseChannels);
+  }
   int nt = comm->maxThreads[info->algorithm][info->protocol];
   int threadThreshold = comm->threadThresholds[info->algorithm][info->protocol];
   if (info->algorithm == NCCL_ALGO_COLLNET_DIRECT) {

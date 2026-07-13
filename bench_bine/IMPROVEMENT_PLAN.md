@@ -349,6 +349,29 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
 
 ## Phase 5 — optional hygiene (any order, low risk)
 
+- **Channel floor for Bine comms — IMPLEMENTED 2026-07-13.** The 64n auto-channel
+  run showed the deployed default (2 channels on 1-NIC topologies) erases Bine's
+  large-message win (needs ≥8–16ch; Bine is the only algorithm here that gains
+  from channels). Fix, NVLS-style: `ncclTopoPostset` raises the channel budget to
+  `NCCL_BINE_NCHANNELS` (default 16, 0=off) on Bine-capable comms (po2 ≤256,
+  1 rank/node), applied after the MIN/MAX block so explicit user settings win
+  (forced-channel benchmarks unaffected). The extra channels are used ONLY by
+  Bine AllGather ops ≥ `NCCL_BINE_NCHANNELS_MINSIZE` (default 128 MB — the size
+  from which 16ch beat the base budget at both 64n and 128n); everything else,
+  including small Bine ops (measured faster at few channels), is clamped back to
+  `comm->bineBaseChannels` in `topoGetAlgoInfo`. Costs: connection buffers for
+  the extra channels; `p2pnChannels` may also rise (lazy buffers, benign).
+  KNOWN SOFT BAND at deployed defaults: 8–16 MB runs at the base budget where,
+  at 2ch, per-channel slices (64–128 KB) exceed the 48 KB crossover → relay with
+  too few pipelines (~0.45x PAT; same as pre-floor deployed behavior). Per-job
+  workaround: `NCCL_BINE_XOVER=131072` (correct for 2ch; do NOT make it the
+  default — it regresses 64 KB-slice sizes at 16ch). Verify after rebuild:
+  `NCCL_DEBUG=INFO` shows "Bine AllGather: raised channel budget 2 -> 16".
+- **Auto-SELECTION model still open**: the tuner still costs the AllGather PAT
+  slot with original-PAT constants, so with NCCL_ALGO unset it may pick Ring at
+  sizes where Bine now wins (e.g. 33–256 MB at 128n/16ch). Fitting new constants
+  from the bench data remains TODO.
+
 - **ReduceScatter landmine** (1-line fix): this fork removed the connections
   RS-PAT needs (upstream's `// ReduceScatter` / `// AllGather` comments are
   swapped relative to actual use). In `src/transport/generic.cc` (~84) change

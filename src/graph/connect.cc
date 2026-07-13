@@ -330,6 +330,10 @@ NCCL_PARAM(MaxNrings, "MAX_NRINGS", -2);
 // New naming
 NCCL_PARAM(MinNchannels, "MIN_NCHANNELS", -2);
 NCCL_PARAM(MaxNchannels, "MAX_NCHANNELS", -2);
+// Channel floor for comms that can run the Bine AllGather (the AllGather PAT slot):
+// its large-message relay is the only algorithm here whose throughput scales with
+// channels, but 1-NIC topologies derive only ~2. 0 disables the floor.
+NCCL_PARAM(BineNchannels, "BINE_NCHANNELS", 16);
 
 int ncclMinNchannels() {
   int minNchannels = 0;
@@ -503,6 +507,31 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
     nChannels = comm->nChannels = std::min(std::min(ncclMaxNchannels(), nChannels), comm->config.maxCTAs);
     nChannels = comm->nChannels =
       copyChannels(comm, nChannels, std::max(ncclMinNchannels(), comm->config.minCTAs), ringPrev, ringNext);
+  }
+
+  // Bine AllGather channel floor (NCCL_BINE_NCHANNELS, default 16). The Bine relay is the
+  // only algorithm here whose LARGE-message throughput scales with channels (measured on
+  // Leonardo, 1 GB busbw: ~8.5 GB/s at 2ch -> ~9.3+ at 16ch at 64-128 nodes, overtaking
+  // PAT only at >=8ch), but 1-NIC topologies derive only ~2 channels, so the deployed
+  // default never sees that win. Raise the budget for Bine-capable comms (same conditions
+  // as the AllGather PAT path: >1 po2 nRanks <= 256, 1 rank/node). The extra channels are
+  // used ONLY by large Bine AllGather ops: everything else is clamped back to the
+  // pre-floor budget in topoGetAlgoInfo via comm->bineBaseChannels (Bine small/mid ops
+  // included -- they are latency-bound and measure FASTER at the base budget). Applied
+  // after the MIN/MAX block, so it is inactive whenever the user's own settings already
+  // meet the floor (forced-channel benchmarks are unaffected), and it still respects
+  // NCCL_MAX_NCHANNELS / maxCTAs. Cost: connection buffers for the extra channels on
+  // Bine-capable comms.
+  if (comm->maxLocalRanks == 1 && comm->nRanks > 1 && (comm->nRanks & (comm->nRanks - 1)) == 0 &&
+      comm->nRanks <= 256) {
+    int bineFloor = (int)ncclParamBineNchannels();
+    bineFloor = std::min(std::min(bineFloor, ncclMaxNchannels()), comm->config.maxCTAs);
+    if (bineFloor > 0 && nChannels < bineFloor) {
+      comm->bineBaseChannels = nChannels;
+      nChannels = comm->nChannels = copyChannels(comm, nChannels, bineFloor, ringPrev, ringNext);
+      INFO(NCCL_INIT | NCCL_GRAPH, "Bine AllGather: raised channel budget %d -> %d (other collectives keep %d)",
+           comm->bineBaseChannels, nChannels, comm->bineBaseChannels);
+    }
   }
 
   comm->collChannels = comm->nChannels;
