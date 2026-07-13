@@ -796,12 +796,13 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
 // pure relay, a huge value (e.g. 2000000000) to force butterfly-wherever-safe, or a
 // specific per-channel byte crossover to sweep. Keep this default in lockstep with the
 // mirror in bench_bine/verify_schedule.py and the NCCL_PARAM default in init.cc.
-// 64 KB: tuned from the 64-node/16-channel same-allocation sweep (xover_sweep.sh) -- best
-// average, and it captures the 4-16 MB butterfly wins. NOTE: tuned BEFORE the slice-based
-// packing fix, which makes the butterfly strictly faster at tiny slices (and newly enables
-// it at nranks=256, where the old chunk-capacity postFreq of 8 < minPost 16 blocked it) --
-// re-run xover_sweep.sh after that rebuild; the optimum can only move UP from 64 KB.
-#define BINE_BUTTERFLY_MAX_BYTES (64 * 1024)
+// 48 KB, from post-packing-fix measurements at BOTH 64n and 128n (16ch): the boundary
+// cases at 32 KB perChan slices (33 MB@64n, 67 MB@128n) measurably prefer the BUTTERFLY
+// (5.76 vs 4.85; 5.42 vs 4.84) while the 64 KB cases (67 MB@64n, 128 MB@128n) prefer the
+// RELAY (7.36 vs 5.47; 6.75 vs 5.10) -- 48 KB splits them. History: 64 KB was tuned
+// pre-packing-fix; the fix's slice-based postFreq also newly qualified 64 KB-slice sizes
+// for the butterfly (pf 2->8 at 128 MB@128n/16ch), regressing them until this adjustment.
+#define BINE_BUTTERFLY_MAX_BYTES (48 * 1024)
 
 template <typename T>
 class PatAGAlgorithm {

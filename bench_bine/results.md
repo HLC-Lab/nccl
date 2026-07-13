@@ -729,3 +729,18 @@ Remaining known gaps: <=1 MB (0.5-0.8x, forced-16ch config auto-tune would never
 33-67 MB ramp. NEXT (optional): re-run xover_sweep.sh (threshold was tuned pre-fix; optimum
 can only move UP from 64 KB), and a 128n rep to see how much the fix recovers there
 (packing gain is largest at 128n: 64 blocks/slot vs 8).
+
+### v10 at 128n/16ch (1 rep, -n 50, default XOVER=64KB): mid recovered; 128MB mode flip found
+
+0 #wrong. vs the pre-fix 07-10 3-rep run: 4 MB 0.45->0.69, 8 MB 0.55->0.83, 16 MB 0.84,
+33 MB 0.90->0.93 (Bine abs +21-43% across 1-33 MB) => the packing fix substantially
+reverses the 128n small/mid erosion. Large: 256 MB 1.13, 512 MB 1.20, 1 GB 1.18 -- headline
+holds. BUT 128 MB fell 0.97 -> 0.69 (Bine abs 6.75 -> 5.10): MECHANISTIC, not noise. At
+128n/16ch, 128 MB has perChan = exactly 64 KB and chunk 256 KB; pre-fix pf = 512K/256K = 2
+< minPost 8 -> RELAY (6.75); post-fix slice-based pf = 8 -> BUTTERFLY (5.10, worse). 67 MB
+made the same relay->butterfly flip and IMPROVED (4.84 -> 5.42). Combined with the 64n sweep
+(67 MB: relay 7.36 > bfly 5.47; 33 MB: bfly 5.76 > relay 4.85), both scales agree:
+butterfly wins at <=32 KB perChan slices, relay wins at >=64 KB perChan.
+=> DEFAULT MOVED 64 KB -> 48 KB (between the two boundary cases): keeps 33 MB@64n and
+67 MB@128n on the butterfly, returns 67 MB@64n and 128 MB@128n to the relay (each worth
++25-35% at its size per the measurements above).
