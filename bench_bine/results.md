@@ -745,6 +745,23 @@ butterfly wins at <=32 KB perChan slices, relay wins at >=64 KB perChan.
 67 MB@128n on the butterfly, returns 67 MB@64n and 128 MB@128n to the relay (each worth
 +25-35% at its size per the measurements above).
 
+### 32-CHANNEL PROBE (128n, XOVER=49152, 1 rep, Bine only -- job died before PAT/Ring):
+### channel scaling is EXHAUSTED at 16ch
+
+Bine 1 GB: 8.53 @32ch vs 8.88/8.70 @16ch (same allocation) -- FLAT. 512 MB: 8.12 vs
+8.44/8.24. So the large-message ceiling (~8.5-9.3 GB/s at both 64n and 128n) is
+CHANNEL-COUNT-INDEPENDENT from 8ch up; more channels cannot push the Ring crossover
+(Ring plateaus ~12 = single-rail saturation). The remaining ~25-30% gap to Ring is a
+channel-independent bottleneck (candidates: dim-0 pairing imbalance -- half of all
+forwarded traffic on one connection; pipeline bubbles in the skew order; proxy/post
+overhead). NOTE 128 MB read 4.89 here: NOT a regression -- at 32ch its per-channel slice
+halves to 32 KB <= 48 KB so it flips to the butterfly (the mode gate is per-channel by
+design); at 32ch the relay/butterfly boundary sits one octave higher in message size.
+Also small sizes degrade further at 32ch (1 MB 0.52 abs vs 0.71-0.87 @16ch) -- consistent
+with the forced-channel tax. => 16ch is Bine's sweet spot at 128n; "delay Ring" needs a
+structural fix (channel-rotation v11 idea, or understanding the ~8.8 ceiling), not more
+channels.
+
 ### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
 
 Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
