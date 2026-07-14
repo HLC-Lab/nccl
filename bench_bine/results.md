@@ -819,8 +819,25 @@ model constants remain TODO for the tuner to actually pick Bine over Ring where 
 (128n mid-range). DEPLOYMENT STORY CLOSED: correct + hang-free to 128n, wins >=128 MB
 out of the box, all knobs (NCCL_BINE_NCHANNELS/_MINSIZE, NCCL_BINE_XOVER) runtime-tunable.
 
+## !!! METHODOLOGY CORRECTION (2026-07-14) — read before the two 128n AUTO entries below !!!
+## The AUTO-channel runs compare Bine WITH the channel floor (2->16ch for large) against
+## Ring/PAT at NCCL's default 2ch, because the floor is compiled into the Bine build only.
+## That is a CONFIG ASYMMETRY, not model misprediction (NCCL_ALGO is forced, so the cost
+## model never runs). It flatters Bine at LARGE sizes and the effect is large:
+##   1 GB, 128n:  forced-16ch (EQUAL) -> Ring 10.09 > Bine 8.04 > PAT 7.03  (RING wins)
+##                auto (Bine@16, others@2) -> Bine 9.08 > Ring 6.71         (Bine "wins")
+## => "Bine best overall / Ring wins nothing" below is an ARTIFACT of unequal channels;
+## at equal channels RING WINS the >=256 MB tail. What SURVIVES equalization (defensible):
+##   - Bine > PAT at large, forced-16ch 1 GB 8.04 vs 7.03 = 1.14x (tree-vs-tree, robust).
+##   - Bine > Ring in the MID-RANGE (2-16 MB) even at EQUAL 16ch: 8 MB Ring 1.18 vs Bine
+##     4.05 = 3.4x -- Ring's n-hop pipeline cannot fill there (channel-INDEPENDENT;
+##     more channels make Ring worse). THIS is Bine's real niche.
+## CORRECTED THESIS: at 128n Bine owns the MID-RANGE (2-64 MB, beats both), Ring owns the
+## BW-bound tail (>=256 MB) at equal channels, PAT owns small. TODO: each-algo-at-own-best-
+## channels run (give Ring a channel sweep too) to draw the true best-of-breed envelope.
+
 ## 2026-07-14 — v11 at 128 NODES, AUTO CHANNELS (first deployed-default 128n run, 1 rep):
-## BINE IS THE BEST ALGORITHM OVERALL; RING WINS NOTHING
+## [SUPERSEDED HEADLINE -- see correction above; valid only as the "deployed build" picture]
 
 Build 188acdf+, no channel forcing (base 2, floor->16 for Bine >=128 MB). 0 #wrong.
 
