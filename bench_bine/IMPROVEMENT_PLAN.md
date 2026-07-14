@@ -395,21 +395,24 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
 
 Question: where does the schedule stop working if the guard were raised?
 
-| n    | static math | relay λ=6 @d8 (real) | λ=6 @d6 (margin) | λ=8 @d8 | λ=4 @d8 | butterfly @minPost | ops needed (relay / bfly) |
-|------|-------------|----------------------|------------------|---------|---------|--------------------|---------------------------|
-| ≤256 | OK          | OK                   | OK               | OK      | OK      | OK (16)            | 384 / 511 (fits 520)      |
-| 512  | OK          | OK                   | OK               | OK (d6 deadlocks) | OK | OK (32)      | 768 / 1023                |
-| 1024 | OK          | OK                   | OK               | OK (d6 deadlocks) | –  | OK (64)      | 1536 / 2047               |
-| 2048 | OK          | OK                   | **DEADLOCK**     | OK      | OK      | OK (128)           | 3072 / 4095               |
-| 4096 | OK          | (pending)            | (pending)        | –       | –       | –                  | 6144 / 8191               |
+| n    | static math | relay λ=6 @d8 / @d6      | λ=5 @d8/@d6 | λ=4 @d8/@d6 | butterfly @minPost | ops (relay / bfly) |
+|------|-------------|--------------------------|-------------|-------------|--------------------|--------------------|
+| ≤256 | OK          | OK / OK                  | OK / OK     | OK / OK     | OK (16)            | 384 / 511 (fits 520) |
+| 512  | OK          | OK / OK                  | – / –       | OK / –      | OK (32)            | 768 / 1023         |
+| 1024 | OK          | OK / OK                  | – / –       | – / –       | OK (64)            | 1536 / 2047        |
+| 2048 | OK          | OK / **DEADLOCK**        | OK / OK     | OK / OK     | OK (128)           | 3072 / 4095        |
+| 4096 | OK          | (not measured; use λ≤5)  | OK / (n/m)  | OK / OK     | (not measured)     | 6144 / 8191        |
 
 FINDINGS: (1) The MATH has no limit in sight -- partition/coverage/wire-order equality hold
-at every po2 tested through 4096. (2) The λ=6 relay order stays LIVE at the real FIFO depth
-through 2048, but its safety margin erodes with scale: full margin ≤1024, ZERO margin at
-2048 (the same zero-margin state λ=8 has at ≤512). λ=4 is live at d8 at 2048. Rule of thumb:
-the safe λ shrinks as n grows; any guard raise beyond 1024 should lower BINE_SKEW_LAMBDA
-(λ=4) or re-verify. (3) Butterfly liveness is fine at its floor everywhere, but minPost =
-n/16 makes it usable only for tiny per-channel slices at scale (≤4 KB at 2048).
+at every po2 tested through 4096. (2) The safe skew shrinks with scale: λ=6 has full margin
+≤1024 and ZERO margin at 2048; **λ=4 is live WITH full depth-6 margin at both 2048 and
+4096** (λ=5 likewise at 2048, and live at the real depth at 4096). Rule for guard raises:
+keep λ=6 up to 1024; use λ=4 beyond (verified to 4096; costs ~15-20% of the modeled
+pipelining vs λ=6 -- see timed_sim). (3) Butterfly liveness holds at its floor at every
+scale measured, but minPost = n/16 confines it to tiny per-channel slices at scale
+(≤4 KB/rank/channel at 2048). (4) NOTE: 4096-rank sims need ~6 GB RAM in the Python
+harness (one job was OOM-killed); use a bigger box or a C++ port of the sim if 8192+ is
+ever of interest. Leonardo's largest usable po2 is 2048 regardless.
 
 TODAY'S 256 LIMIT IS DATA TYPES, NOT ALGORITHM. To raise the guard to 512/1024 (model-safe
 with full margin): cmask unsigned char -> unsigned short (nsteps 9-10 > 8 bits -- required
