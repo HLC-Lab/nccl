@@ -850,6 +850,21 @@ delivers at scale: 512 MB-1 GB at 8.56-9.38 GB/s = 1.57-1.63x PAT (PAT at 2ch is
 (4) 1 rep -- ratios >=1.5 at large are far beyond noise; a 3-rep re-run would make it
 citable. NEXT: 256n (guard boundary; predicted: window widens further).
 
+### 3-REP CONFIRMATION (same allocation): the capstone is citable
+
+avg per rep: Bine 1.83/1.67/1.74 vs PAT 1.61/1.49/1.54 vs Ring 1.18/1.14/1.21 -- Bine best
+on average in EVERY rep. 3-rep means: 2 MB 1.09, 4 MB 1.61, 8 MB 1.73 (butterfly band,
+best-of-all); 128 MB 1.13, 256 MB 1.38, 512 MB 1.45, 1 GB 1.45 (floor/relay band,
+best-of-all); Ring wins nothing. DIP CONFIRMED at 16-67 MB (0.50/0.57/0.82): exactly the
+sizes that run the RELAY on the BASE 2-channel budget -- bounded below by the 48 KB
+crossover (16 MB slice = 64 KB > 48 KB ends the butterfly) and above by the 128 MB channel
+floor (16ch begins). In that window the relay has 2 pipelines and sub-plateau slices
+(64-256 KB) while PAT sits at its design center (2ch + aggregation). Butterfly rescue is
+SAFETY-blocked at 33-67 MB (2ch slices 128-256 KB pack only 4/2 per slot < minPost 8);
+threshold rescue works only for 16 MB; extending the floor downward is n-dependent (helps
+33 MB at 128n per the 16ch data, HURTS the same band at 64n). Documented as the known
+structural band; per-job mitigation NCCL_BINE_XOVER=131072 (fixes 16 MB only).
+
 ### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
 
 Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
