@@ -819,6 +819,37 @@ model constants remain TODO for the tuner to actually pick Bine over Ring where 
 (128n mid-range). DEPLOYMENT STORY CLOSED: correct + hang-free to 128n, wins >=128 MB
 out of the box, all knobs (NCCL_BINE_NCHANNELS/_MINSIZE, NCCL_BINE_XOVER) runtime-tunable.
 
+## 2026-07-14 — v11 at 128 NODES, AUTO CHANNELS (first deployed-default 128n run, 1 rep):
+## BINE IS THE BEST ALGORITHM OVERALL; RING WINS NOTHING
+
+Build 188acdf+, no channel forcing (base 2, floor->16 for Bine >=128 MB). 0 #wrong.
+
+| size    | Ring |  PAT | Bine | B/PAT | B/Ring | best  |
+|---------|-----:|-----:|-----:|------:|-------:|-------|
+| 1 MB    | 0.27 | 0.72 | 0.52 | 0.72  |  1.93  | PAT   |
+| 2 MB    | 0.20 | 1.04 | 1.09 | 1.05  |  5.45  | BINE  |
+| 4 MB    | 0.40 | 1.64 | 1.81 | 1.10  |  4.52  | BINE  |
+| 8 MB    | 0.65 | 2.17 | 1.56 | 0.72  |  2.40  | PAT   |
+| 16 MB   | 1.25 | 3.19 | 1.12 | 0.35  |  0.90  | PAT (Bine soft band) |
+| 33 MB   | 1.90 | 4.55 | 2.53 | 0.56  |  1.33  | PAT   |
+| 67 MB   | 3.53 | 5.07 | 3.96 | 0.78  |  1.12  | PAT   |
+| 128 MB  | 3.14 | 5.74 | 6.59 | 1.15  |  2.10  | BINE  |
+| 256 MB  | 5.24 | 5.82 | 6.09 | 1.05  |  1.16  | BINE  |
+| 512 MB  | 6.29 | 5.26 | 8.56 | 1.63  |  1.36  | BINE  |
+| 1 GB    | 6.95 | 5.98 | 9.38 | 1.57  |  1.35  | BINE  |
+| **avg** | 1.09 | 1.56 | 1.60 |       |        | BINE  |
+
+READS: (1) THE SCALE THESIS CONFIRMED AT DEPLOYED DEFAULTS: at 64n Ring owned everything
+>=16 MB; at 128n Ring wins NOT A SINGLE SIZE (127-hop pipeline cannot fill; 1 GB only 6.95).
+Bine is the best algorithm at 2-4 MB and everything >=128 MB, and best ON AVERAGE
+(1.60 > PAT 1.56 > Ring 1.09) -- out of the box, zero configuration. (2) The channel floor
+delivers at scale: 512 MB-1 GB at 8.56-9.38 GB/s = 1.57-1.63x PAT (PAT at 2ch is weak at
+128n large: 5.3-6.0). 1 GB 9.38 is the best 128n Bine number recorded in any config.
+(3) Soft band persists, shifted with n: 16 MB craters at 0.35 (slice 64 KB -> relay at
+2ch; the known channel-budget-dependent crossover artifact), 8-67 MB belongs to PAT.
+(4) 1 rep -- ratios >=1.5 at large are far beyond noise; a 3-rep re-run would make it
+citable. NEXT: 256n (guard boundary; predicted: window widens further).
+
 ### 48 KB CONFIRMED on HW (128n/16ch, NCCL_BINE_XOVER=49152 at runtime, 1 rep, same alloc)
 
 Prediction hit exactly: 128 MB 5.12 -> 7.21 GB/s (0.77 -> 1.05, relay) with 67 MB still
