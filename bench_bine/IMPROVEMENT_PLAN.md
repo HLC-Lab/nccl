@@ -391,6 +391,36 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
 
 ---
 
+## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
+
+Question: where does the schedule stop working if the guard were raised?
+
+| n    | static math | relay λ=6 @d8 (real) | λ=6 @d6 (margin) | λ=8 @d8 | λ=4 @d8 | butterfly @minPost | ops needed (relay / bfly) |
+|------|-------------|----------------------|------------------|---------|---------|--------------------|---------------------------|
+| ≤256 | OK          | OK                   | OK               | OK      | OK      | OK (16)            | 384 / 511 (fits 520)      |
+| 512  | OK          | OK                   | OK               | OK (d6 deadlocks) | OK | OK (32)      | 768 / 1023                |
+| 1024 | OK          | OK                   | OK               | OK (d6 deadlocks) | –  | OK (64)      | 1536 / 2047               |
+| 2048 | OK          | OK                   | **DEADLOCK**     | OK      | OK      | OK (128)           | 3072 / 4095               |
+| 4096 | OK          | (pending)            | (pending)        | –       | –       | –                  | 6144 / 8191               |
+
+FINDINGS: (1) The MATH has no limit in sight -- partition/coverage/wire-order equality hold
+at every po2 tested through 4096. (2) The λ=6 relay order stays LIVE at the real FIFO depth
+through 2048, but its safety margin erodes with scale: full margin ≤1024, ZERO margin at
+2048 (the same zero-margin state λ=8 has at ≤512). λ=4 is live at d8 at 2048. Rule of thumb:
+the safe λ shrinks as n grows; any guard raise beyond 1024 should lower BINE_SKEW_LAMBDA
+(λ=4) or re-verify. (3) Butterfly liveness is fine at its floor everywhere, but minPost =
+n/16 makes it usable only for tiny per-channel slices at scale (≤4 KB at 2048).
+
+TODAY'S 256 LIMIT IS DATA TYPES, NOT ALGORITHM. To raise the guard to 512/1024 (model-safe
+with full margin): cmask unsigned char -> unsigned short (nsteps 9-10 > 8 bits -- required
+even for 512); scratch arrays [260] -> [n+4]; RMAXOPS 520 -> 2n-1 (butterfly) or 1.5n
+(relay-only); tuning.cc + generic.cc caps; extend verify_schedule SIZES and re-run ALL
+gates. For 2048 additionally set λ=4 and budget the O(n^2) emission scan (4M iterations
+per channel per call on one GPU thread ≈ ms -- switch to counting sort on key = s+λ·depth,
+range n+λ·nsteps, making it O(n)). Device shmem sendDims/recvDims[32] already cover 2^32.
+Hardware validation at each new scale remains mandatory (the model is necessary, not
+sufficient -- it has caught every liveness bug but cannot see NIC/proxy effects).
+
 ## Do-NOTs (each was tested; do not re-litigate without new evidence)
 
 1. **Do not add fixed-size slot packing to the relay.** Simulated: deadlocks
