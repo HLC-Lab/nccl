@@ -819,7 +819,41 @@ model constants remain TODO for the tuner to actually pick Bine over Ring where 
 (128n mid-range). DEPLOYMENT STORY CLOSED: correct + hang-free to 128n, wins >=128 MB
 out of the box, all knobs (NCCL_BINE_NCHANNELS/_MINSIZE, NCCL_BINE_XOVER) runtime-tunable.
 
-## 2026-07-14 evening — 64n MANUAL fair probe (equal-16 vs auto, SAME allocation, 1 rep each)
+## 2026-07-15 — THE FAIR ENVELOPE, 128 NODES (fair_envelope.sh, C in {2,16}, 2 reps,
+## one allocation) — AUTHORITATIVE COMPARISON; supersedes ALL prior 128n theses
+
+Each algorithm at ITS OWN best channel count per size (the fair best-of-breed):
+
+| size    | Ring best | PAT best | Bine best | winner | Bine/PAT | Bine/Ring |
+|---------|----------:|---------:|----------:|--------|---------:|----------:|
+| <=2 MB  | (weak)    | dominates| ~Ring     | PAT    | 0.4-0.8  | ~1        |
+| 4 MB    | 2.12@16   | 4.07@16  | 2.62@2    | PAT    | 0.64     | 1.24      |
+| 8 MB    | 3.29@16   | 5.80@16  | 3.89@2    | PAT    | 0.67     | 1.18      |
+| 16 MB   | 4.96@16   | 6.22@2   | 4.87@16   | PAT    | 0.78     | 0.98      |
+| 33 MB   | 7.32@16   | 7.19@16  | 5.28@16   | Ring~PAT| 0.73    | 0.72      |
+| 67 MB   | 7.46@16   | 7.31@16  | 5.66@2    | Ring~PAT| 0.77    | 0.76      |
+| 128 MB  | 7.61@16   | 7.58@16  | 8.66@16   | BINE   | 1.14     | 1.14      |
+| 256 MB  | 10.45@16  | 7.72@2   | 8.91@16   | Ring   | 1.15     | 0.85      |
+| 512 MB  | 10.18@2   | 7.68@2   | 9.36@16   | Ring   | 1.22     | 0.92      |
+| 1 GB    | 10.56@16  | 7.77@2   | 9.34@16   | Ring   | 1.20     | 0.88      |
+
+HONEST READS (this supersedes the "Bine owns 2-64 MB" corrected thesis, which was ALSO an
+artifact -- of comparing at a SINGLE equal channel count where PAT/Ring were off their
+per-size optima; fair-PAT@best is far stronger at mid than any single-config PAT, e.g.
+16M: PAT@2 6.22 vs the 3.89 it scored in the forced-16 runs):
+(1) FAIR WINNER MAP AT 128n: PAT <=16 MB; Ring >=256 MB (and 33-67 MB, though Ring 7.32
+vs PAT 7.19 there is within noise); BINE WINS EXACTLY ONE SIZE: 128 MB (+14% over both).
+Bine is a solid SECOND at 256 MB-1 GB (0.85-0.92x Ring, 1.15-1.22x PAT).
+(2) The durable tree-vs-tree claim survives cleanly: Bine > PAT at >=128 MB by 14-22%
+AT EACH ALGORITHM'S BEST CONFIG -- the PAT-slot replacement is unambiguously better for
+large messages. Below 128 MB fair-PAT wins the tree contest (0.64-0.78).
+(3) Ring's 33-67 MB "collapse" from the July-10 runs did NOT reproduce (7.3-7.5 here vs
+2-4 then, same nominal config) -- Ring's absolutes swing enormously with placement; the
+earlier "Bine owns the mid-range" was built partly on a Ring-cold allocation.
+(4) Bine's fair niche at 128n = the ~128 MB band where PAT's aggregation has saturated
+and Ring's pipeline has not yet filled. The scale question (does this band widen at
+256n?) is the remaining open experiment. CAVEATS: 2 reps, one allocation, C in {2,16}
+only (C=8 might lift Bine's 16-67 MB somewhat -- interior-peak risk was accepted).
 
 Run A: NCCL_MIN_NCHANNELS=16 (no MAX) -> all three algos at a 16-channel budget (Bine floor
 inactive since budget >= floor). NOTE: banner/log-dir say "chdef" because final_compare.sh
