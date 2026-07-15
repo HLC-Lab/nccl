@@ -727,6 +727,15 @@ __device__ __host__ inline int binePi(int rank, int step, int nranks) {
   return dest;
 }
 
+// Phase 7 block-striping: which channel owns source block s, given stripeC channels.
+// CONTIGUOUS assignment (balance-selected in bench_bine/stripe_study.py: worst-channel
+// egress 1.07-1.51x ideal, vs 2-4x for s%C which correlates with negabinary tree roles).
+// Identical on host and device by construction (pure function of s,C,n). stripeC==1 =>
+// always channel 0, i.e. no striping (every current call site keeps today's behavior).
+__device__ __host__ inline int bineStripe(int s, int stripeC, int nranks) {
+  return (int)((long long)s * stripeC / nranks);
+}
+
 // Bine AllGather over negabinary edges. TWO SCHEDULES, one op-list class, picked at
 // construction from the chunk size (see postFreq / useButterfly in the constructor):
 //
@@ -835,6 +844,13 @@ class PatAGAlgorithm {
   __device__ __host__ void sortAsc(int* a, int m) {
     for (int i = 1; i < m; i++) { int v = a[i], j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; j--; } a[j + 1] = v; }
   }
+  // Compact a[] in place to the blocks in this stripe; returns the kept count.
+  __device__ __host__ int stripeFilter(int* a, int m, int stripeC, int stripeIdx) {
+    if (stripeC <= 1) return m;
+    int w = 0;
+    for (int i = 0; i < m; i++) if (bineStripe(a[i], stripeC, nranks) == stripeIdx) a[w++] = a[i];
+    return w;
+  }
 
   // Enumerate get_indexes(start,st) in DFS pre-order into out[]; returns count.
   // If dep != nullptr, dep[i] = tree depth of out[i] below 'start' (e0 has depth 1);
@@ -877,8 +893,16 @@ public:
   // xoverBytes: butterfly/relay crossover on THIS channel's per-rank bytes, from
   // comm->bineXover (NCCL_BINE_XOVER; default BINE_BUTTERFLY_MAX_BYTES). Same value on
   // host and device by construction (set once at init, copied into the device comm).
+  // stripeC/stripeIdx (Phase 7 block-striping): this instance emits ops ONLY for source
+  // blocks s with bineStripe(s,stripeC,nranks)==stripeIdx. stripeC==1 (default) => no
+  // striping, every block, identical to pre-Phase-7. When striping, the caller passes the
+  // FULL per-rank range (offset=0, end=count) so each channel moves WHOLE blocks (bigger
+  // messages) for its stripe rather than a byte-slice of every block. Both endpoints of
+  // every connection filter by the same global bineStripe(s), so per-connection wire order
+  // is preserved (verified in bench_bine/stripe_study.py). See IMPROVEMENT_PLAN Phase 7.
   __device__ __host__ PatAGAlgorithm(int slotBytes, int xoverBytes, size_t offset, size_t end,
-                                     size_t count, int chunkCount, int rank, int nranks)
+                                     size_t count, int chunkCount, int rank, int nranks,
+                                     int stripeC = 1, int stripeIdx = 0)
     : offset(offset), end(end), count(count), chunkCount(chunkCount), rank(rank), nranks(nranks) {
     nsteps = log2Up(nranks);
     nelem = getNelem();
@@ -940,11 +964,14 @@ public:
       // blocks r needs (getIdx(r,t)). Per-connection order matches because both
       // endpoints enumerate the same sorted set. postFreq blocks share a slot.
       int sbuf[260], rbuf[260];
-      push(0, -1, -1, rank);                   // INIT: own block input -> output
+      if (bineStripe(rank, stripeC, nranks) == stripeIdx)
+        push(0, -1, -1, rank);                 // INIT own block (only if it is our stripe)
       for (int t = nsteps - 1; t >= 0; t--) {
         int partner = binePi(rank, t, nranks);
         int ns = getIdx(partner, t, sbuf); sortAsc(sbuf, ns);   // blocks r sends to partner
         int nr = getIdx(rank, t, rbuf);    sortAsc(rbuf, nr);   // blocks r receives from partner
+        ns = stripeFilter(sbuf, ns, stripeC, stripeIdx);        // keep only this stripe's blocks
+        nr = stripeFilter(rbuf, nr, stripeC, stripeIdx);        // (packing runs over the kept set)
         for (int j = 0; j < ns; j++) {
           int post = (j % postFreq == postFreq - 1) || (j == ns - 1);
           push(1, -1, t, sbuf[j], j % postFreq, post ? 1 : 0);  // SEND-only (bit0 = postSend)
@@ -982,6 +1009,7 @@ public:
           if (key < bestKey) { bestKey = key; s = x; }     // strict '<': equal keys -> smaller x
         }
         emitted[s] = 1;
+        if (stripeC > 1 && bineStripe(s, stripeC, nranks) != stripeIdx) continue; // not our stripe
         if (s == rank) {
           push(0, -1, -1, rank);                 // INIT: own block input -> output
           for (int k = 0; k < nsteps; k++) if (cmask[s] & (1u << k)) push(1, -1, k, s); // forward own block to every child
