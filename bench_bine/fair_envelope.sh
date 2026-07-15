@@ -24,7 +24,10 @@ OUT=$ROOT/nccl/bench_bine/fair_$(date +%Y%m%d_%H%M%S)_N${N}
 mkdir -p "$OUT"
 
 run() { # name lib algo C rep
-  local name=$1 lib=$2 algo=$3 C=$4 rep=$5 log="$OUT/${name}_c${C}_rep${rep}.log"
+  local name=$1 lib=$2 algo=$3 C=$4 rep=$5
+  # NB: must be a separate 'local' line -- the local builtin expands ALL its
+  # arguments before assigning any, so ${name} would be unbound above (set -u).
+  local log="$OUT/${name}_c${C}_rep${rep}.log"
   env NCCL_MIN_NCHANNELS=$C NCCL_MAX_NCHANNELS=$C NCCL_ALGO=$algo \
     LD_LIBRARY_PATH=$ROOT/$lib/build/lib:${LD_LIBRARY_PATH:-} \
     srun -N "$N" -n "$N" --ntasks-per-node=1 --unbuffered --export=ALL "$TEST" $ARGS > "$log" 2>&1
