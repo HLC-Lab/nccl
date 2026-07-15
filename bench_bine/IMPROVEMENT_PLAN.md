@@ -391,6 +391,36 @@ Phases 1–4 already deliver correct scaling + a competitive sweep.
 
 ---
 
+## Phase 6 — parallel relay for the 16-128 MB band: STUDIED, NO-GO (2026-07-15)
+
+Question: can the unfused, dim-side-grouped relay (parallelFactor>1 via group ownership +
+cross-group dependency counters) lift the band from ~5 GB/s to the fair-envelope targets
+(PAT 6.2-7.3 / Ring 7.3-7.5 at 128n)? Needed: dimpar/fused >= 1.28 (16 MB), 1.39 (33 MB),
+1.32 (67 MB).
+
+Method: two timed models bracketing reality (bench_bine/phase6_study.py):
+  v1, independent 12.5 GB/s per connection (NO shared-NIC constraint): calibration FAILED
+     3.2-4.9x TOO FAST -- over-credits parallelism, i.e. biased TOWARD go.
+  v2, shared per-rank egress+ingress with joint endpoint reservation: calibration FAILED
+     35-68% TOO SLOW (holdout 512MB residual 68%) -- over-punishes parallelism, biased
+     AGAINST go.
+Neither is predictive in absolute terms; but the DIMPAR/FUSED RATIO in the band regime is
+consistent across both extremes: v1 gives 0.96-1.24 at band configs, v2 gives 1.20-1.32.
+Bracket: ~1.0-1.3x, vs required 1.28-1.39. Even the flattering end only touches the
+weakest target (16 MB parity); 33/67 MB stay LOSE at every point in the bracket.
+Applying the bracket to measured numbers: 16 MB 4.87 -> 5.8-6.3 (target 6.22),
+33 MB 5.28 -> 6.3-6.9 (7.32), 67 MB 5.66 -> 6.8-7.4 (7.46). No wins.
+
+VERDICT: NO-GO. The parallel relay's headroom in the band regime (~1.2-1.3x, dominated by
+unfusing costs + dim-0 serialization + shared-NIC ceiling) does not clear the bar that
+would justify unfused ops (2x copy), per-group completion counters in the kernel,
+skip-padding, and re-verified liveness. The 16-128 MB band is NOT winnable with this
+schedule family on this fabric; the honest claims remain: >=128 MB beats PAT by 14-22%
+best-vs-best, wins outright at the ~128 MB crossover band, second to Ring above.
+(Phase 4b's small-message closure stands unchanged; this extends it to the mid band.)
+Remaining cheap option: the interior-channel band sweep (C in {4,8}, XOVER arms) may
+recover PARITY points at 16/67 MB -- worth one allocation, no code.
+
 ## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
 
 Question: where does the schedule stop working if the guard were raised?
