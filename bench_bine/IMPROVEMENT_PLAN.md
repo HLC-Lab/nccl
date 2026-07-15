@@ -421,6 +421,49 @@ best-vs-best, wins outright at the ~128 MB crossover band, second to Ring above.
 Remaining cheap option: the interior-channel band sweep (C in {4,8}, XOVER arms) may
 recover PARITY points at 16/67 MB -- worth one allocation, no code.
 
+## Phase 7 — BLOCK-STRIPED CHANNELS (designed + offline-verified 2026-07-15; C++ TODO)
+
+MOTIVATION (measured): at fixed n=128/C=16 the sliced design executes the IDENTICAL
+per-channel schedule for 33/128/512 MB — same ops, same posts — yet throughput is
+5.28 / 8.66 / 9.36 GB/s: purely a function of MESSAGE SIZE (16K/64K/256K). The machinery
+is per-message-overhead-bound in the band, and byte-slicing (NCCL's Ring-oriented
+convention) makes message size collapse as channels grow. Striping decouples them.
+
+DESIGN: channels partition the SET of source blocks, each block travels WHOLE on exactly
+one channel. Stripe fn = CONTIGUOUS: stripe(s) = s*C/n (balance-selected: straggler
+1.07-1.51x vs 2-4x for s%C, which correlates with negabinary tree roles). Schedules are
+the existing skew-relay / packed-butterfly restricted to the stripe (a pure filter — no
+new schedule math). Butterfly safety relaxes to ceil(maxRound_c/pf) <= NCCL_STEPS with
+maxRound_c ~ (n/2)/C (needPf=1 with full-slot blocks from C=8 at n=128). Verified in
+stripe_study.py: static + liveness(d8,d6) + balance, all n<=256, C<=16 — PASS.
+
+EXPECTED EFFECT (by the measured message-size curve): band messages become size/n
+regardless of C — 33 MB@128n = 256 KB messages (the 9.3 GB/s regime, vs 5.28 today);
+16 MB = 128 KB (~8.7 regime vs 4.87). Targets are 6.2-7.5 => the band flips to
+win/parity. >=128 MB: blocks exceed the slot and chunk back to ~512 KB pieces — behavior
+~unchanged (the existing win is not at risk).
+
+C++ IMPLEMENTATION PLAN (the delicate part is host/device pairing — Do-NOT #7):
+1. Inputs: device stripeIdx = ncclShmem.channelId - work->channelLo, C = channelHi-Lo+1
+   (fields exist); proxy has op->channelId + op->nChannels (exists) + needs the op's
+   base channel (add a field or derive) and the FULL per-rank count (today the proxy
+   gets per-channel size as 'count' — the old count trap; must pass full count, e.g.
+   via op->nbytes semantics change for the PAT pattern, paired with the byte-compare
+   gate before any run).
+2. PatAGAlgorithm: constructor gains (stripeC, stripeIdx); emission filters blocks by
+   stripe; offset/end become (0, fullCount) on BOTH sides; chunking unchanged (blocks
+   larger than the slot chunk as today).
+3. Kernel (all_gather.h): use full count; ignore the byte-split channelOffset/Count in
+   the PAT branch. Enqueue: no split change needed if the kernel ignores it (verify
+   work-elem count semantics); proxy nsteps come from the same striped replay ✓.
+4. Mode selection SIMPLIFIES: message size = blockBytes = count*sizeof(T) (channel-
+   independent!) -> single crossover on block size; the channel-dependent xover
+   machinery and its artifacts retire. postFreq = slot/min(blockBytes, chunk);
+   butterfly gate = ceil(maxRound_c/pf) <= NCCL_STEPS.
+5. Gates: extend the dump harness to (stripeC, stripeIdx) grids; byte-compare C++ vs
+   StripedRelay/StripedButterfly mirrors; then hardware -c 1 at 4..128 nodes before
+   any perf run. RMAXOPS shrinks per channel (~1.5*ceil(n/C)) — keep 520.
+
 ## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
 
 Question: where does the schedule stop working if the guard were raised?
