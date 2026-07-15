@@ -819,6 +819,28 @@ model constants remain TODO for the tuner to actually pick Bine over Ring where 
 (128n mid-range). DEPLOYMENT STORY CLOSED: correct + hang-free to 128n, wins >=128 MB
 out of the box, all knobs (NCCL_BINE_NCHANNELS/_MINSIZE, NCCL_BINE_XOVER) runtime-tunable.
 
+## 2026-07-14 evening — 64n MANUAL fair probe (equal-16 vs auto, SAME allocation, 1 rep each)
+
+Run A: NCCL_MIN_NCHANNELS=16 (no MAX) -> all three algos at a 16-channel budget (Bine floor
+inactive since budget >= floor). NOTE: banner/log-dir say "chdef" because final_compare.sh
+only echoes NCCL_FORCE_CH -- the run WAS 16ch. Run B: auto (Bine floor on; Ring/PAT 2ch).
+
+Run A (EQUAL 16ch): avg Bine 1.93 > PAT 1.85 > Ring 1.62. Bine/PAT: 4M 1.01, 8M 1.07,
+16M 0.99, 33M 1.01, 128M 1.04, 256M 1.15, 512M 1.11, 1G 1.10. Bine/Ring at 1G: 0.97.
+Run B (auto, same alloc): avg Bine 1.78 > PAT 1.49 > Ring 1.32; large Bine/PAT 1.30-1.51.
+
+READS: (1) At EQUAL 16ch the auto-run mid dip largely VANISHES (8-33M at 0.99-1.07 vs
+0.5-0.66 at 2ch): 16ch shrinks slices under the crossover -> butterfly. The dip is a
+config artifact of the base budget, not the schedule. (2) Bine>PAT at large at equal
+channels again (1.04-1.15) -- stable across every allocation to date. (3) CAUTION on
+Bine/Ring 0.97 @1G: Ring hit only 8.97 here vs 11.79 in the v10 3-rep equal-16 run --
+Ring's absolute numbers swing hugely between allocations. Do NOT conclude Bine~Ring at
+64n from 1 rep; the durable 64n claims remain Bine>PAT (all sizes >=4M at equal 16ch,
+this run) and Ring>Bine at the large tail (multi-rep evidence). (4) PAT@2ch anomalously
+weak in Run B (1G 5.70 vs typical 8.5-9.5) -- same-allocation A/B is the only safe
+contrast here; treat both as indicative until the scripted envelope (now fixed) runs
+with reps.
+
 ## !!! METHODOLOGY CORRECTION (2026-07-14) — read before the two 128n AUTO entries below !!!
 ## The AUTO-channel runs compare Bine WITH the channel floor (2->16ch for large) against
 ## Ring/PAT at NCCL's default 2ch, because the floor is compiled into the Bine build only.
