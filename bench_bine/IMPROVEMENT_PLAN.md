@@ -421,7 +421,7 @@ best-vs-best, wins outright at the ~128 MB crossover band, second to Ring above.
 Remaining cheap option: the interior-channel band sweep (C in {4,8}, XOVER arms) may
 recover PARITY points at 16/67 MB -- worth one allocation, no code.
 
-## Phase 7 — BLOCK-STRIPED CHANNELS (designed + offline-verified 2026-07-15; C++ TODO)
+## Phase 7 — BLOCK-STRIPED CHANNELS (IMPLEMENTED 2026-07-16 behind NCCL_BINE_STRIPE, default OFF; awaiting hardware)
 
 MOTIVATION (measured): at fixed n=128/C=16 the sliced design executes the IDENTICAL
 per-channel schedule for 33/128/512 MB — same ops, same posts — yet throughput is
@@ -443,26 +443,36 @@ regardless of C — 33 MB@128n = 256 KB messages (the 9.3 GB/s regime, vs 5.28 t
 win/parity. >=128 MB: blocks exceed the slot and chunk back to ~512 KB pieces — behavior
 ~unchanged (the existing win is not at risk).
 
-C++ IMPLEMENTATION PLAN (the delicate part is host/device pairing — Do-NOT #7):
-1. Inputs: device stripeIdx = ncclShmem.channelId - work->channelLo, C = channelHi-Lo+1
-   (fields exist); proxy has op->channelId + op->nChannels (exists) + needs the op's
-   base channel (add a field or derive) and the FULL per-rank count (today the proxy
-   gets per-channel size as 'count' — the old count trap; must pass full count, e.g.
-   via op->nbytes semantics change for the PAT pattern, paired with the byte-compare
-   gate before any run).
-2. PatAGAlgorithm: constructor gains (stripeC, stripeIdx); emission filters blocks by
-   stripe; offset/end become (0, fullCount) on BOTH sides; chunking unchanged (blocks
-   larger than the slot chunk as today).
-3. Kernel (all_gather.h): use full count; ignore the byte-split channelOffset/Count in
-   the PAT branch. Enqueue: no split change needed if the kernel ignores it (verify
-   work-elem count semantics); proxy nsteps come from the same striped replay ✓.
-4. Mode selection SIMPLIFIES: message size = blockBytes = count*sizeof(T) (channel-
-   independent!) -> single crossover on block size; the channel-dependent xover
-   machinery and its artifacts retire. postFreq = slot/min(blockBytes, chunk);
-   butterfly gate = ceil(maxRound_c/pf) <= NCCL_STEPS.
-5. Gates: extend the dump harness to (stripeC, stripeIdx) grids; byte-compare C++ vs
-   StripedRelay/StripedButterfly mirrors; then hardware -c 1 at 4..128 nodes before
-   any perf run. RMAXOPS shrinks per channel (~1.5*ceil(n/C)) — keep 520.
+C++ IMPLEMENTATION (2026-07-16, single runtime switch NCCL_BINE_STRIPE, default 0=OFF —
+one build serves both; OFF is byte-identical to the validated pre-Phase-7 behavior):
+1. Switch: NCCL_PARAM BineStripe (init.cc) -> comm->bineStripe -> devcomm copy (same
+   plumbing as NCCL_BINE_XOVER). Engages ONLY when blockBytes = count*sizeof(T) >
+   bineXover (so today's tuned small-message butterfly path is untouched); striped mode
+   is therefore always the RELAY on whole blocks.
+2. Host inputs (the count trap, solved): proxyOp->specifics.pat.{sizePerRank, stripeC,
+   stripeIdx} — sizePerRank = info->count*eltSize set in calcCollChunking (NOT derived
+   from op->nbytes: its DIVUP(nBytes,nChannels) rounding would desync host/device);
+   stripeC/stripeIdx = (nChannels, c - devWork->channelLo) set in the per-channel
+   proxy-op loop of scheduleCollTasksToPlan, PAT-AG guarded.
+3. Device (all_gather.h): when gated on, pass (offset=0, end=count, stripeC =
+   channelHi-channelLo+1, stripeIdx = channelId-channelLo) and recompute chunk =
+   min(count, slotBytes/sizeof(T)) — both sides derive chunk from (block, slot) with
+   identical element-floor arithmetic, so no dependence on enqueue's per-slice chunking.
+4. Proxy (proxy.cc PatDown): mirror block, T=char in bytes; chunk floor-aligned to
+   eltSize to match the device's slotBytes/sizeof(T) floor exactly.
+GATES RUN (all PASS, 2026-07-16):
+   - caller_check.py: 15,120-combo brute force of device-vs-host caller arithmetic
+     (gate, stripe params, end/chunk equivalence, ctor mode+postFreq) incl. buffSize
+     not divisible by eltSize (the alignment trap).
+   - stripe_multichunk.py: striped-relay FIFO liveness at nchunks=3 (chunk-loop replay),
+     depths 8 and 6, all n<=256 C<=16, every channel — 280 sims.
+   - Constructor core unchanged this commit; previous 30,856-op-list byte-compare vs
+     Python mirrors stands.
+   - g++ -fsyntax-only: proxy.cc, enqueue.cc, init.cc clean; nvcc device compile of
+     generated all_gather.cu clean (link-stage extern only).
+HARDWARE PROTOCOL (one build, no interactive loop): default-off run must reproduce
+current numbers; then NCCL_BINE_STRIPE=1 -c 1 correctness; then the band benchmark.
+If the striped run misbehaves, simply leave the env unset — nothing else changed.
 
 ## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
 

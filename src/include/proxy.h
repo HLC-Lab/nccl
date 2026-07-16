@@ -68,6 +68,15 @@ union ncclProxyOpSpecifics {
     int recvSlices;
     int stepSize;
   } bcast;
+  struct {
+    // Bine AllGather block-striping (NCCL_BINE_STRIPE). sizePerRank = FULL per-rank block
+    // bytes (task->count * eltSize) -- op->nbytes is per-CHANNEL and cannot be used, its
+    // DIVUP rounding would desync host vs device op lists (=> network hang). stripeC =
+    // number of channels of this op, stripeIdx = this channel's position in [0,stripeC).
+    // Must match the device kernel's (channelHi-channelLo+1, channelId-channelLo).
+    size_t sizePerRank;
+    int stripeC, stripeIdx;
+  } pat;
 };
 
 struct ncclProxyOp {

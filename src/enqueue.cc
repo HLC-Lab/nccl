@@ -778,6 +778,12 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
         proxyOp->channelId = c;
         proxyOp->opCount = proxyOpId;
         proxyOp->task.coll = task;
+        if (task->algorithm == NCCL_ALGO_PAT && task->func == ncclFuncAllGather) {
+          // Bine block-striping: same values the device kernel derives from
+          // work->channelLo/Hi and ncclShmem.channelId. Host/device MUST agree.
+          proxyOp->specifics.pat.stripeC = nChannels;
+          proxyOp->specifics.pat.stripeIdx = c - devWork->channelLo;
+        }
         proxyOp->rank = comm->rank;
         proxyOp->ringAlgo = NULL;
         if (proxyOp->reg && task->algorithm == NCCL_ALGO_RING && (task->recvNetHandles[c] || task->sendNetHandles[c])) {
@@ -2457,6 +2463,14 @@ static ncclResult_t calcCollChunking(struct ncclComm* comm, struct ncclTaskColl*
 
   if (pattern == ncclPatternPatUp || pattern == ncclPatternPatDown) {
     proxyOp->nbytes = DIVUP(nBytes, nChannels);
+    // Bine block-striping inputs. sizePerRank = FULL per-rank block bytes; the proxy MUST
+    // NOT derive this from nbytes (per-channel, DIVUP-rounded => host/device desync =>
+    // hang). stripeC/stripeIdx are per-channel and overwritten in the channel loop of
+    // scheduleCollTasksToPlan; init to the inert values here so every PAT proxy op has
+    // them defined.
+    proxyOp->specifics.pat.sizePerRank = info->count * ncclTypeSize(info->datatype);
+    proxyOp->specifics.pat.stripeC = 1;
+    proxyOp->specifics.pat.stripeIdx = 0;
   }
 
   // Set peer count hints used by network plugin

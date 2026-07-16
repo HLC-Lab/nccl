@@ -133,11 +133,33 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
     if (tid == nworkers) shmem->parallelFactor = 0;
     __syncthreads();
 
+    // Bine block-striping (NCCL_BINE_STRIPE): when the per-rank block exceeds the
+    // butterfly/relay crossover, each channel of this op relays WHOLE blocks of its
+    // contiguous stripe (full range, stripeC/stripeIdx filter) instead of a byte-slice of
+    // every block -- per-message size grows by nChannels. The chunk is recomputed as
+    // min(block, slot) from (count, buffSizes) so it no longer depends on the per-channel
+    // slice enqueue chunked for. EVERY input here (count*sizeof(T), bineStripe, bineXover,
+    // channelHi-channelLo+1, channelId-channelLo, buffSizes) is mirrored byte-for-byte by
+    // the host proxy (proxy.cc ncclPatternPatDown, via proxyOp->specifics.pat) -- any
+    // divergence produces different op lists and a network hang (Do-NOT #7).
+    size_t patOffset = channelOffset;
+    size_t patEnd = channelOffset + channelCount;
+    size_t patChunk = chunkCount;
+    int stripeC = 1, stripeIdx = 0;
+    if (ncclShmem.comm.bineStripe && count * sizeof(T) > (size_t)ncclShmem.comm.bineXover) {
+      stripeC = (int)(work->channelHi - work->channelLo + 1);
+      stripeIdx = ncclShmem.channelId - (int)work->channelLo;
+      patOffset = 0;
+      patEnd = count;
+      size_t slotElems = (size_t)(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS) / sizeof(T);
+      patChunk = count < slotElems ? count : slotElems;
+    }
+
     if (tid == nworkers) {
       // Algo computation thread
       PatAGAlgorithm<T> patAlgo(ncclShmem.comm.buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS,
-                                ncclShmem.comm.bineXover, channelOffset, channelOffset + channelCount, count,
-                                chunkCount, rank, nranks);
+                                ncclShmem.comm.bineXover, patOffset, patEnd, count,
+                                (int)patChunk, rank, nranks, stripeC, stripeIdx);
       shmem->parallelFactor = patAlgo.getParallelFactor();
       int step = 0;
       while (1) {

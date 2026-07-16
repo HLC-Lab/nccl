@@ -718,8 +718,25 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       const ssize_t size = op->nbytes / comm->nRanks;
       const int rank = comm->rank, nranks = comm->nRanks;
       int *nstepsSend = NULL, *nstepsRecv = NULL;
-      PatAGAlgorithm<char> algo(comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, comm->bineXover, 0, size, size,
-                                op->chunkSize, rank, nranks);
+      // Bine block-striping: mirror of the device gate in all_gather.h -- same inputs,
+      // same arithmetic (T=char here, so sizes are in bytes; the chunk is floored to a
+      // whole number of elements exactly like the device's slotBytes/sizeof(T)). Any
+      // divergence => different op lists => wrong per-dim step counts => network hang.
+      ssize_t patOffset = 0, patEnd = size, patCount = size;
+      ssize_t patChunk = op->chunkSize;
+      int stripeC = 1, stripeIdx = 0;
+      if (comm->bineStripe && op->specifics.pat.sizePerRank > (size_t)comm->bineXover) {
+        const ssize_t blockBytes = (ssize_t)op->specifics.pat.sizePerRank; // task->count * eltSize
+        const ssize_t eltSize = ncclTypeSize((ncclDataType_t)op->dtype);
+        stripeC = op->specifics.pat.stripeC;
+        stripeIdx = op->specifics.pat.stripeIdx;
+        patOffset = 0;
+        patEnd = patCount = blockBytes;
+        ssize_t slotAligned = (ssize_t)(comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS) / eltSize * eltSize;
+        patChunk = blockBytes < slotAligned ? blockBytes : slotAligned;
+      }
+      PatAGAlgorithm<char> algo(comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS, comm->bineXover, patOffset, patEnd,
+                                patCount, (int)patChunk, rank, nranks, stripeC, stripeIdx);
       struct ncclPatStep ps = {0};
       NCCLCHECKGOTO(ncclCalloc(&nstepsSend, log2Up(nranks)), result, exit_pat_down);
       NCCLCHECKGOTO(ncclCalloc(&nstepsRecv, log2Up(nranks)), result, exit_pat_down);

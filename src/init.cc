@@ -604,6 +604,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
   tmpCommAndChans.comm.bineXover = comm->bineXover;
+  tmpCommAndChans.comm.bineStripe = comm->bineStripe;
   tmpCommAndChans.comm.p2pChunkSize = comm->p2pChunkSize;
   tmpCommAndChans.comm.p2pCrossClique = comm->p2pCrossClique;
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];
@@ -821,6 +822,16 @@ NCCL_PARAM(Ll128BuffSize, "LL128_BUFFSIZE", -2);
 // 64n+128n/16ch: 32 KB-slice sizes prefer butterfly, 64 KB-slice sizes prefer relay).
 NCCL_PARAM(BineXover, "BINE_XOVER", 48 * 1024);
 
+// Bine AllGather Phase 7: block-striped channels. When != 0 and the per-rank block is
+// larger than the crossover, each channel of a multi-channel op moves WHOLE source blocks
+// of its contiguous stripe (bineStripe(s) == channel index) through the relay schedule,
+// instead of a 1/nChannels byte-slice of EVERY block. Same total bytes per channel, but
+// per-message size grows by nChannels (e.g. 33 MB @ 128 ranks x 16 channels: 16 KB slices
+// -> 256 KB blocks), attacking the measured per-message-overhead-bound 16-128 MB band.
+// Default off: schedules verified offline (bench_bine/stripe_study.py + byte-compare vs
+// the real constructor), but not yet validated on hardware.
+NCCL_PARAM(BineStripe, "BINE_STRIPE", 0);
+
 NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pPciChunkSize, "P2P_PCI_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pNvlChunkSize, "P2P_NVL_CHUNKSIZE", (1 << 19)); /* 512 kB */
@@ -833,6 +844,7 @@ static ncclResult_t computeBuffSizes(struct ncclComm* comm) {
     comm->buffSizes[p] = envs[p] != -2 ? envs[p] : defaults[p];
   }
   comm->bineXover = (int)ncclParamBineXover();
+  comm->bineStripe = (int)ncclParamBineStripe();
 
   if (comm->nNodes > 1) {
     // GBx platforms only have 4 GPUs per host, which reduces the aggregation factor.

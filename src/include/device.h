@@ -445,6 +445,7 @@ struct ncclKernelComm {
   bool p2pCrossClique;
   int isAllNvlink;
   int bineXover; // Bine AllGather butterfly/relay crossover (per-channel per-rank bytes), from NCCL_BINE_XOVER
+  int bineStripe; // Bine AllGather block-striped channels (NCCL_BINE_STRIPE, default 0=off)
 
   int* collNetDenseToUserRank;
 
