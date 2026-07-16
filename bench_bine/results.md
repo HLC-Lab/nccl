@@ -948,3 +948,41 @@ avg Bine 2.00 > PAT 1.94 -- FIRST avg win at 128 nodes (1 rep; the stable claim 
 the env var must be NCCL_BINE_XOVER -- plain BINE_XOVER is silently ignored, tested).
 Remaining soft spots unchanged: <=4 MB (0.25-0.77, pf=1 + forced-ch artifact) and the
 33-67 MB butterfly band (0.73-0.90).
+
+## 2026-07-16 — v12: PHASE 7 STRIPING ON HARDWARE (64 nodes, one allocation, ebf0afc build)
+
+Three runs, single build, runtime switch only:
+  (1) default (STRIPE off), 1 rep x20   — sanity: must reproduce pre-Phase-7 behavior
+  (2) NCCL_BINE_STRIPE=1 + FORCE_CH=16, 2 reps x50 — the band read at equal channels
+  (3) NCCL_BINE_STRIPE=1, auto channels, 2 reps x50 — deployed picture
+
+SANITY (1): PASS. 0 #wrong, no hang; >=128 MB 1.10-1.21x PAT with the floor (1 GB 9.85),
+band/small at 2ch in the usual range. Default path confirmed untouched by the plumbing.
+
+STRIPED 16ch (2): 0 #wrong, NO HANG — host/device pairing holds on hardware.
+THE 33-67 MB STRUCTURAL DIP IS GONE (the Phase-6 "not winnable with this schedule
+family" band): Bine/PAT at 8/16/33/67/128 MB = 1.06 / 1.17 / 1.12 / 1.22 / 1.22
+(pre-stripe same config: ~0.8-0.96, both modes losing). 67 MB hit 9.39 GB/s — the
+message-size model called it: block 1 MB -> 512 KB chunks = the ~9.3 plateau regime.
+Avg busbw Bine 2.59/2.62 > PAT 2.33/2.34 > Ring 2.35/2.31 in both reps.
+
+STRIPED auto (3): 128 MB = 9.44 GB/s = 1.46x PAT (floor 16ch + striping compound);
+>=256 MB unchanged vs stripe-off (1.19-1.26); 8-67 MB parity-ish (0.78-0.96) because
+auto grants only the 2ch base budget there — the floor MINSIZE=128MB predates striping.
+
+BEST-vs-BEST across all three runs (fair envelope discipline, this allocation):
+  <=4 MB: PAT.  8 MB-128 MB: BINE WINS OUTRIGHT vs both rivals' best configs
+  (8M 5.08 vs PAT-best 4.78 / Ring-best 2.93; 16M 6.76 vs 5.97/4.95; 33M 8.10 vs
+  7.26/6.95; 67M 9.39 vs 7.68/6.54; 128M 9.44 vs 7.00/7.86). 256 MB: tie with Ring
+  (9.63 vs 9.75). >=512 MB: Ring (10.48-10.93 vs Bine 9.29-9.85).
+This is a step change from the pre-stripe envelope (Bine won only the ~128 MB point).
+Caveats: 64 nodes (the band was measured worst at 128n — confirmation pending), one
+allocation, 2 reps.
+
+CONSEQUENCE COMMITTED (host-only): with NCCL_BINE_STRIPE on, the channel-floor onset
+NCCL_BINE_NCHANNELS_MINSIZE defaults to 8 MB instead of 128 MB (explicit env still wins).
+Rationale: striped channels move whole blocks, so channels no longer shrink messages —
+the old "floor-down hurts at 64n" objection (v11 notes) was a byte-slicing artifact, and
+(2) shows striped-16ch beating both rivals' BEST configs from 8 MB. Stripe-off behavior
+unchanged. NEXT: single 128n protocol re-run; if the band holds, flip NCCL_BINE_STRIPE
+default to 1.

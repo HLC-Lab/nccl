@@ -2086,8 +2086,19 @@ static ncclResult_t topoGetAlgoInfo(struct ncclComm* comm, struct ncclTaskColl* 
     // Bine ops: they are latency-bound and measure FASTER at the base budget (Leonardo
     // 64n: 8 MB 5.1 GB/s at 2ch vs 4.1 at 16ch), while the relay's multi-peer width
     // only pays off at large sizes (128 MB+: 8.6 at 16ch vs 7.7 at 2ch).
+    // With block-striping (NCCL_BINE_STRIPE) the floor pays off much earlier: striped
+    // channels move WHOLE blocks, so more channels no longer shrink the message size.
+    // Measured (Leonardo 64n, striped 16ch vs each rival's best config): Bine wins
+    // outright from 8 MB (8/16/33/67/128 MB = 1.06-1.22x PAT-best, 1.17-1.73x
+    // Ring-best), while below 8 MB the base budget is still faster (4 MB: 0.92 at
+    // 16ch striped). So the striped default onset is 8 MB; an explicit
+    // NCCL_BINE_NCHANNELS_MINSIZE still overrides both defaults.
+    size_t bineMinBytes = (size_t)ncclParamBineNchannelsMinBytes();
+    if (comm->bineStripe && getenv("NCCL_BINE_NCHANNELS_MINSIZE") == nullptr) {
+      bineMinBytes = 8 * 1024 * 1024;
+    }
     bool bigBine = info->func == ncclFuncAllGather && info->algorithm == NCCL_ALGO_PAT &&
-                   nBytes >= (size_t)ncclParamBineNchannelsMinBytes();
+                   nBytes >= bineMinBytes;
     if (!bigBine) nc = std::min(nc, comm->bineBaseChannels);
   }
   int nt = comm->maxThreads[info->algorithm][info->protocol];
