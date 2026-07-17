@@ -477,6 +477,30 @@ widened {128 MB} -> {33, 67(tie), 128 MB}; 33 MB 5.28 -> 8.16 GB/s as the messag
 model predicted; Ring tail lead narrowed to 4-7%. Follow-up: channel-floor onset
 defaults to 8 MB when striping (572bc94); NCCL_BINE_STRIPE default flipped to 1.
 
+PHASE 7b — STRIPED BUTTERFLY (2026-07-17, targets the remaining 4-16 MB PAT gap at 128n):
+the caller gate now stripes EVERY multi-channel op (not just blocks > xover); the ctor's
+existing block-size crossover picks the mode — blocks <= xover run the striped PACKED
+butterfly (whole blocks per channel, pf = slot/block blocks per post: at 4 MB@128n/16ch
+that is 512 KB wires instead of the legacy 2 KB slices), larger blocks the striped relay
+(unchanged v12/v13 behavior above the crossover). Safety floor pf >= divUp(n/2,8) kept
+CONSERVATIVE (per-stripe rounds would allow less — not needed: target sizes pass).
+Single-channel ops and blocks <= xover at 1ch keep the legacy path. NEW GUARD both
+sides: never stripe when the op has more channels than ranks — bineStripe(s) is only
+surjective for stripeC <= nranks, so beyond that some stripes are EMPTY (reachable at
+n<=16 under the 16-channel floor — latent in v12/v13 code, never hit on HW since runs
+were n>=64); getNextOp also gained a defensive empty-schedule early-exit (reading
+opKind[0] of an empty list executes garbage). GATES (all PASS 2026-07-17): byte-compare
+76,360 op-lists incl. striped butterfly over the SHIPPED pf range [minPost, n/2] and
+C == n; caller_check.py 30,000 combos (new gate + mode expectations + C>n fallback +
+pack-overflow assert); bfly_pf_gate.py 926 striped-butterfly liveness sims (all
+channels, shipped pf range, multi-chunk edge); relay multichunk + verify_schedule
+regression; g++/nvcc compile checks. Expected on HW (128n/16ch): 4 MB (32 KB blocks,
+pf 16) and 8 MB (64 KB blocks, pf 8) now run the striped butterfly — the sizes where
+v13 best-vs-best trails PAT 0.57x/0.79x. Realistic target: 8 MB win/parity (gap 1.26x,
+message-shape territory); 4 MB stretch (gap 1.74x, partly the parallelFactor=1 device
+limit). 16 MB (128 KB blocks, pf 4 < minPost 8) stays striped relay by the safety
+floor — likely correct per the 64n slice-boundary data (64 KB+ units: relay > bfly).
+
 ## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
 
 Question: where does the schedule stop working if the guard were raised?

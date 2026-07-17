@@ -722,10 +722,15 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
       // same arithmetic (T=char here, so sizes are in bytes; the chunk is floored to a
       // whole number of elements exactly like the device's slotBytes/sizeof(T)). Any
       // divergence => different op lists => wrong per-dim step counts => network hang.
+      // specifics.pat.stripeC == the device's channelHi-channelLo+1; multi-channel ops
+      // stripe at ANY block size (mode = ctor's block-size crossover: butterfly below,
+      // relay above), single-channel ops only above the crossover, and ops with more
+      // channels than ranks never stripe (empty-stripe guard).
       ssize_t patOffset = 0, patEnd = size, patCount = size;
       ssize_t patChunk = op->chunkSize;
       int stripeC = 1, stripeIdx = 0;
-      if (comm->bineStripe && op->specifics.pat.sizePerRank > (size_t)comm->bineXover) {
+      if (comm->bineStripe && op->specifics.pat.stripeC <= nranks &&
+          (op->specifics.pat.sizePerRank > (size_t)comm->bineXover || op->specifics.pat.stripeC > 1)) {
         const ssize_t blockBytes = (ssize_t)op->specifics.pat.sizePerRank; // task->count * eltSize
         const ssize_t eltSize = ncclTypeSize((ncclDataType_t)op->dtype);
         stripeC = op->specifics.pat.stripeC;

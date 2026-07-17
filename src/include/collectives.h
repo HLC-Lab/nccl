@@ -1034,6 +1034,21 @@ public:
     ps->last = 0; ps->recvDim = -1; ps->sendDim = -1; ps->recvOffset = 0; ps->sendOffset = 0;
     ps->stepOffset = 0; ps->postRecv = 0; ps->postSend = 0; ps->inpIx = 0; ps->outIx = 0;
     nelem = getNelem(); ps->nelem = nelem;
+    if (nOps == 0) {
+      // Defensive: an empty schedule must terminate cleanly (and identically) on host and
+      // device instead of executing opKind[0] garbage. Unreachable via the callers: they
+      // stripe only when stripeC <= nranks, and bineStripe(s) = s*stripeC/nranks is
+      // surjective onto [0,stripeC) there, so every channel's stripe is non-empty.
+      ps->nelem = 0; ps->last = 2;
+      int doneFlags = PatUsed;
+#if __CUDA_ARCH__ >= 600
+      cuda::atomic_ref<int, cuda::thread_scope_block> d(ps->flags);
+      d.store(doneFlags, cuda::memory_order_release);
+#else
+      ps->flags = doneFlags;
+#endif
+      return;
+    }
     int K = opKind[ip], rd = opRdim[ip], sd = opSdim[ip], s = opSrc[ip];
     int slotPos = opSlotPos[ip], postBits = opPost[ip];
     if (K == 0) {                                              // INIT: own block input -> output[rank]

@@ -133,21 +133,30 @@ struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_PAT, NCCL_PROTO_SIMPLE
     if (tid == nworkers) shmem->parallelFactor = 0;
     __syncthreads();
 
-    // Bine block-striping (NCCL_BINE_STRIPE): when the per-rank block exceeds the
-    // butterfly/relay crossover, each channel of this op relays WHOLE blocks of its
-    // contiguous stripe (full range, stripeC/stripeIdx filter) instead of a byte-slice of
-    // every block -- per-message size grows by nChannels. The chunk is recomputed as
-    // min(block, slot) from (count, buffSizes) so it no longer depends on the per-channel
-    // slice enqueue chunked for. EVERY input here (count*sizeof(T), bineStripe, bineXover,
-    // channelHi-channelLo+1, channelId-channelLo, buffSizes) is mirrored byte-for-byte by
-    // the host proxy (proxy.cc ncclPatternPatDown, via proxyOp->specifics.pat) -- any
-    // divergence produces different op lists and a network hang (Do-NOT #7).
+    // Bine block-striping (NCCL_BINE_STRIPE): each channel of a multi-channel op moves
+    // WHOLE blocks of its contiguous stripe (full range, stripeC/stripeIdx filter)
+    // instead of a byte-slice of every block -- per-message size grows by nChannels. The
+    // MODE then falls out of the ctor's existing block-size crossover: blocks <= xover
+    // run the striped packed BUTTERFLY (small-block regime), larger blocks the striped
+    // relay. Also engages single-channel when the block exceeds the crossover (chunk
+    // normalization only; stripeC=1 filters nothing). NEVER engages when the op has more
+    // channels than ranks: bineStripe(s) = s*stripeC/nranks is surjective onto
+    // [0,stripeC) only for stripeC <= nranks -- beyond that some stripes are EMPTY
+    // (reachable at n<=16 under the 16-channel floor), so fall back to byte-slicing.
+    // The chunk is recomputed as min(block, slot) from (count, buffSizes) so it no
+    // longer depends on the per-channel slice enqueue chunked for. EVERY input here
+    // (count*sizeof(T), bineStripe, bineXover, channelHi-channelLo+1,
+    // channelId-channelLo, buffSizes) is mirrored byte-for-byte by the host proxy
+    // (proxy.cc ncclPatternPatDown, via proxyOp->specifics.pat) -- any divergence
+    // produces different op lists and a network hang (Do-NOT #7).
     size_t patOffset = channelOffset;
     size_t patEnd = channelOffset + channelCount;
     size_t patChunk = chunkCount;
     int stripeC = 1, stripeIdx = 0;
-    if (ncclShmem.comm.bineStripe && count * sizeof(T) > (size_t)ncclShmem.comm.bineXover) {
-      stripeC = (int)(work->channelHi - work->channelLo + 1);
+    int opChannels = (int)(work->channelHi - work->channelLo + 1);
+    if (ncclShmem.comm.bineStripe && opChannels <= nranks &&
+        (count * sizeof(T) > (size_t)ncclShmem.comm.bineXover || opChannels > 1)) {
+      stripeC = opChannels;
       stripeIdx = ncclShmem.channelId - (int)work->channelLo;
       patOffset = 0;
       patEnd = count;
