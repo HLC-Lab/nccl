@@ -986,3 +986,36 @@ the old "floor-down hurts at 64n" objection (v11 notes) was a byte-slicing artif
 (2) shows striped-16ch beating both rivals' BEST configs from 8 MB. Stripe-off behavior
 unchanged. NEXT: single 128n protocol re-run; if the band holds, flip NCCL_BINE_STRIPE
 default to 1.
+
+## 2026-07-17 — v13: 128n FAIR ENVELOPE WITH STRIPING (CHANS 2/8/16, 1 rep, one alloc)
+
+NCCL_BINE_STRIPE=1 CHANS="2 8 16" fair_envelope.sh 128 1 50 — every algorithm at its own
+best channel count per size (true best-vs-best; supersedes the 2026-07-15 pre-stripe
+envelope as THE authoritative 128n picture).
+
+WINNER MAP (each at own best C):
+  <=16 MB : PAT   (Bine best-vs-best 8M 0.79, 16M 0.86 — up from 0.63-era but still PAT's)
+  33 MB   : BINE  8.16 vs PAT 7.63 (1.07) / Ring 6.94 (1.18)   [pre-stripe: Bine lost]
+  67 MB   : BINE~ 9.13 vs Ring 9.12 (tie) / PAT 7.70 (1.19)    [pre-stripe: Ring]
+  128 MB  : BINE  9.74 vs Ring 9.26 (1.05) / PAT 7.90 (1.23)   [held, was the only win]
+  >=256 MB: Ring  10.66-11.09 vs Bine 10.23-10.32 (0.93-0.96)  [gap narrowed from
+            0.85-0.92; Bine/PAT there 1.19-1.31]
+
+READS: (1) THE PHASE-7 THESIS CONFIRMED AT 128n: 33 MB went 5.28 -> 8.16 GB/s at 16ch —
+the block-message-size mapping (256 KB blocks = the ~8.7-9.3 regime) predicted this jump;
+the Phase-6 "not winnable" verdict applied to the SLICED schedule family only. (2) Bine's
+fair winning band at 128n widened from one size {128 MB} to {33, 67(tie), 128 MB} — the
+16-128 MB target band is now mostly Bine's. (3) The 64n "wins from 8 MB" does NOT
+transfer: at 128n blocks are half as large per total size and PAT is stronger small —
+8-16 MB stay PAT's (0.79-0.86 best-vs-best). (4) Bine's best C is 16 for every size
+>=8 MB — the striped floor (onset 8 MB) picks the right budget automatically. (5) Caveats:
+1 rep, one allocation; 512K-2M oddities (0.45-1.53 vs PAT) are un-striped sizes (blocks
+< 48 KB xover) = the usual small-size story, not striping effects.
+
+DURABLE CLAIMS UPDATE (128n best-vs-best): Bine > PAT for everything >=33 MB (1.07-1.31);
+Bine > or = Ring 33-128 MB; Ring keeps only the >=256 MB tail and by 4-7% not 8-15%.
+
+CONSEQUENCE: NCCL_BINE_STRIPE default flipped 0 -> 1 (both scales validated: 0 wrong, no
+hang, band flipped). NCCL_BINE_STRIPE=0 restores exact pre-Phase-7 behavior. Remaining
+open items: 256n run (window-widening prediction), tuner-model constants for
+auto-selection, RS-PAT one-line fix, history squash.

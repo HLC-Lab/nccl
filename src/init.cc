@@ -828,9 +828,10 @@ NCCL_PARAM(BineXover, "BINE_XOVER", 48 * 1024);
 // instead of a 1/nChannels byte-slice of EVERY block. Same total bytes per channel, but
 // per-message size grows by nChannels (e.g. 33 MB @ 128 ranks x 16 channels: 16 KB slices
 // -> 256 KB blocks), attacking the measured per-message-overhead-bound 16-128 MB band.
-// Default off: schedules verified offline (bench_bine/stripe_study.py + byte-compare vs
-// the real constructor), but not yet validated on hardware.
-NCCL_PARAM(BineStripe, "BINE_STRIPE", 0);
+// Default ON since the hardware validation (results.md v12/v13): 64n and 128n clean
+// (0 wrong, no hang); 128n fair envelope moved the 33-128 MB band from losses to wins
+// (33 MB 5.28 -> 8.16 GB/s). Set 0 for the exact pre-Phase-7 behavior.
+NCCL_PARAM(BineStripe, "BINE_STRIPE", 1);
 
 NCCL_PARAM(P2pNetChunkSize, "P2P_NET_CHUNKSIZE", (1 << 17)); /* 128 kB */
 NCCL_PARAM(P2pPciChunkSize, "P2P_PCI_CHUNKSIZE", (1 << 17)); /* 128 kB */

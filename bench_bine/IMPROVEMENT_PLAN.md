@@ -421,7 +421,7 @@ best-vs-best, wins outright at the ~128 MB crossover band, second to Ring above.
 Remaining cheap option: the interior-channel band sweep (C in {4,8}, XOVER arms) may
 recover PARITY points at 16/67 MB -- worth one allocation, no code.
 
-## Phase 7 — BLOCK-STRIPED CHANNELS (IMPLEMENTED 2026-07-16 behind NCCL_BINE_STRIPE, default OFF; awaiting hardware)
+## Phase 7 — BLOCK-STRIPED CHANNELS (DONE; HW-validated 64n+128n; NCCL_BINE_STRIPE default ON since 2026-07-17, =0 restores pre-Phase-7 behavior; see results.md v12/v13)
 
 MOTIVATION (measured): at fixed n=128/C=16 the sliced design executes the IDENTICAL
 per-channel schedule for 33/128/512 MB — same ops, same posts — yet throughput is
@@ -470,9 +470,12 @@ GATES RUN (all PASS, 2026-07-16):
      Python mirrors stands.
    - g++ -fsyntax-only: proxy.cc, enqueue.cc, init.cc clean; nvcc device compile of
      generated all_gather.cu clean (link-stage extern only).
-HARDWARE PROTOCOL (one build, no interactive loop): default-off run must reproduce
-current numbers; then NCCL_BINE_STRIPE=1 -c 1 correctness; then the band benchmark.
-If the striped run misbehaves, simply leave the env unset — nothing else changed.
+HARDWARE VALIDATION (complete): 64n v12 — 0 wrong, no hang, off-sanity reproduced
+pre-P7 numbers, striped@16ch killed the 33-67 MB dip (1.06-1.22x PAT from 8 MB).
+128n v13 — fair envelope (CHANS 2/8/16, each algo at own best): Bine's winning band
+widened {128 MB} -> {33, 67(tie), 128 MB}; 33 MB 5.28 -> 8.16 GB/s as the message-size
+model predicted; Ring tail lead narrowed to 4-7%. Follow-up: channel-floor onset
+defaults to 8 MB when striping (572bc94); NCCL_BINE_STRIPE default flipped to 1.
 
 ## Scaling beyond the 256-rank guard (offline study, 2026-07-13/14, scale_study.py)
 
